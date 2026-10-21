@@ -1,0 +1,3237 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+appmixer — мини-микшер громкости по приложениям для PipeWire / WirePlumber.
+
+Чем отличается от pavucontrol / pwvucontrol / wiremix:
+  показывает ВСЕ запущенные приложения, которые используют звук, включая
+  молчащие и висящие в трее. Обычные микшеры их не видят, потому что в
+  PipeWire громкость принадлежит ПОТОКУ, а не приложению: замолчало —
+  поток уничтожен, ползунка нет. Здесь ползунок есть всегда.
+
+Как это работает:
+  * у приложения есть активный поток  ->  pactl set-sink-input-volume
+    (громкость меняется мгновенно);
+  * приложение молчит                 ->  создаём на 0.5 с беззвучный поток
+    с тем же application.name через pw-cat. WirePlumber запоминает громкость
+    по имени приложения и сам применит её, когда приложение зазвучит.
+    Никаких фоновых демонов не нужно — память ведёт сам WirePlumber.
+
+Приложения группируются по процессу: Discord, у которого потоки называются
+«WEBRTC VoiceEngine», «Chromium input» и «discord_capture», показывается
+одной строкой «Discord».
+
+Использование:
+  appmixer            — открыть окно (вешается на Shift + нажатие роллера)
+  appmixer --list     — напечатать таблицу в терминал и выйти (для отладки)
+"""
+
+import json
+import warnings
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import zlib
+from pathlib import Path
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("GdkPixbuf", "2.0")
+
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "ru.fragilich.appmixer"
+APP_TITLE = "Fragile Gain"
+
+# Всё живёт рядом с самим микшером: проект лежит в ~/Projects/appmixer,
+# настройки — в config/, беззвучный файл для «фантомных» потоков — в data/.
+BASE_DIR = Path(__file__).resolve().parent
+CONF_DIR = BASE_DIR / "config"
+STATE_FILE = CONF_DIR / "volumes.json"
+UI_FILE = CONF_DIR / "ui.json"
+DATA_DIR = BASE_DIR / "data"
+SILENCE = DATA_DIR / "silence.wav"
+WP_PROPS = Path.home() / ".local" / "state" / "wireplumber" / "stream-properties"
+
+PHANTOM_MS = 1500        # длительность беззвучного потока (WirePlumber успевает сохранить)
+PHANTOM_MARK = "fragilich.appmixer.phantom"   # метка наших беззвучных потоков
+APPLY_DELAY_MS = 250    # антидребезг ползунка
+REFRESH_MS = 1000       # период обновления списка
+
+# Клиенты, которые не являются пользовательскими приложениями.
+SYSTEM_BINARIES = {
+    "wireplumber", "pipewire", "xdg-desktop-portal", "niri", "quickshell",
+    "pactl", "wpctl", "pw-cat", "appmixer", "pavucontrol", "pwvucontrol",
+    "wiremix",
+}
+SYSTEM_NAMES = {
+    "wireplumber", "wireplumber [client]", "pipewire", "xdg-desktop-portal",
+    "niri", "quickshell", "noctalia-qs", "pactl", "wpctl", "pw-cat",
+    "appmixer", "pavucontrol", "pwvucontrol", "wiremix",
+}
+
+# Красивые имена по имени исполняемого файла.
+PRETTY_BINARY = {
+    "brave": "Brave", "brave-browser": "Brave",
+    "dopamine": "Dopamine",
+    "discord": "Discord",
+    "steam": "Steam", "steamwebhelper": "Steam",
+    "telegram": "Telegram", "telegram-desktop": "Telegram",
+    "claude-desktop": "Claude",
+    "mpv": "mpv", "vlc": "VLC", "firefox": "Firefox", "spotify": "Spotify",
+    "code": "VS Code", "obs": "OBS",
+}
+
+# Приложения, которые умеют издавать звук: их показываем в списке, даже когда
+# они молчат (у таких программ клиент в аудиосервере появляется только на время
+# воспроизведения — как у mpv, который живёт в трее и молчит).
+MEDIA_BINARIES = {
+    # плееры и медиацентры
+    "mpv", "mpv-bash", "vlc", "cvlc", "mplayer", "smplayer", "ffplay", "ffmpeg",
+    "celluloid", "totem", "parole", "haruna", "dragon", "mpc-qt", "audacious",
+    "deadbeef", "strawberry", "clementine", "elisa", "rhythmbox", "cmus",
+    "mpd", "kodi", "quodlibet", "lollypop", "amberol", "gapless", "nuclear",
+    "spotify", "pithos", "youtube-music", "feishin", "sonixd",
+    # звук из браузеров и мессенджеров
+    "firefox", "firefox-bin", "chromium", "chrome", "google-chrome-stable",
+    "brave", "brave-browser", "vivaldi", "opera", "telegram-desktop",
+    "discord", "vesktop", "element-desktop", "signal-desktop", "zoom",
+    "slack", "teams", "skypeforlinux", "steam", "steamwebhelper", "lutris",
+    # игры и прочее
+    "wine64-preloader", "wine", "prismlauncher", "minecraft-launcher",
+    "obs", "gst-play-1.0", "paplay", "pw-play", "sox", "play",
+}
+
+ICON_BY_BINARY = {
+    "brave": "brave-browser", "brave-browser": "brave-browser",
+    "steam": "steam", "steamwebhelper": "steam",
+    "telegram": "telegram", "discord": "discord", "anki": "anki",
+    "mpv": "mpv", "vlc": "vlc", "dopamine": "dopamine", "firefox": "firefox",
+    "spotify": "spotify", "code": "code",
+}
+# Бинарники, которые ничего не говорят о приложении (плееры-обёртки, интерпретаторы,
+# лаунчеры): в таких случаях подпись берём из application.name.
+GENERIC_BINARIES = {
+    "pw-cat", "pw-play", "paplay", "pacat", "pw-dump", "pw-cli",
+    "python", "python3", "sh", "bash", "zsh", "env", "node", "electron",
+}
+
+# Через эти процессы дерево приложений не строим: оболочки, терминалы, сессия.
+# Именно поэтому mpv, запущенный из терминала, остаётся сам себе корнем, а mpv
+# под Anki (anki -> mpv) вкладывается в Anki.
+IGNORE_COMM = GENERIC_BINARIES | SYSTEM_BINARIES | {
+    "systemd", "systemd-logind", "systemd-journald", "systemd-oomd", "init",
+    "dbus-daemon", "dbus-broker", "dbus-broker-lau", "login", "sshd", "sudo",
+    "uwsm", "niri", "gnome-shell", "plasmashell", "kwin_wayland",
+    "kitty", "alacritty", "foot", "footclient", "wezterm", "wezterm-gui",
+    "konsole", "gnome-terminal-", "gnome-terminal", "xterm", "urxvt", "st",
+    "tmux", "tmux: server", "screen", "yakuake", "ghostty", "terminator",
+    "tilix", "xfce4-terminal", "mate-terminal", "lxterminal", "ptyxis",
+    "zsh", "fish", "dash", "runuser", "su", "setsid", "nohup", "env",
+    "startplasma-wayland", "xdg-desktop-portal", "xdg-desktop-portal-gtk",
+    # лаунчеры и песочницы: приложение считаем корнем, а не «внутри flatpak»
+    "flatpak", "flatpak-session-helper", "bwrap", "snap", "snap-confine",
+    "distrobox", "toolbox", "gtk-launch", "gio", "xdg-open", "kdeinit5",
+    "klauncher", "kded5", "rofi", "wofi", "fuzzel", "bemenu", "walker",
+    "anyrun", "ulauncher", "tofi", "wmenu", "dmenu", "rofi-sensible-",
+}
+
+# «python3.14», «node20» и подобное — та же обёртка, просто с версией
+GENERIC_VERSION_RE = re.compile(r"^(.*?)[-_]?v?(\d+(?:\.\d+)*)$")
+
+LIVE_ICON, MUTE_ICON = "audio-volume-high-symbolic", "audio-volume-muted-symbolic"
+
+# Предел перетаскивания ползунка. Выше — можно колесом мыши (или Ctrl+колесо),
+# предел при этом расширяется сам, так что «потолка» по громкости нет.
+MAX_VOLUME = 300          # документированный «потолок разгона» (реально его нет)
+VOLUME_STEP = 2
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Оформление (ui-ux-pro-max: Data-Dense Dashboard + тёмная серая палитра).
+#  Токены цвета заданы один раз и используются по имени.
+#    серый   — слайдер и фокус        зелёный — «звучит сейчас»
+#    янтарь  — громкость выше 100 %   красный — мьют
+#  Строки по сетке «плитка · подпись | слайдер | мьют | значение»; приложение и
+#  его вложенные источники склеены в одну карточку со стволом дерева слева.
+# ─────────────────────────────────────────────────────────────────────────────
+
+THEMES = {
+    "dark": {
+        "FG": "white", "NAME_FG": "#f1f5f9", "SURFACE_BG": "#131313",
+        "CARD_BG": "#1e1e1e", "CARD_HOVER": "#272727", "MASTER_BG": "#262626",
+        "CHILD_BG": "#191919", "CHILD_HOVER": "#232323",
+        "ACCENT": "#c8c8c8", "ACCENT_HOVER": "#e6e6e6",
+        "LIVE_COLOR": "#22c55e", "LIVE_TEXT": "#4ade80",
+        "BOOST_COLOR": "#f59e0b", "BOOST_TEXT": "#fbbf24",
+        "MUTED_COLOR": "#ef4444", "MUTE_TEXT": "#fca5a5",
+        "THUMB": "#f8fafc", "TREE_LINE": "rgba(255, 255, 255, 0.28)",
+        "SHADOW": "0.5", "KNOB": "#ededed", "KNOB_ICON": "#1e1e1e",
+    },
+    "light": {
+        "FG": "black", "NAME_FG": "#18181b", "SURFACE_BG": "#c9c9cb",
+        "CARD_BG": "#e4e4e6", "CARD_HOVER": "#d9d9dc", "MASTER_BG": "#ececee",
+        "CHILD_BG": "#d8d8db", "CHILD_HOVER": "#cfcfd2",
+        "ACCENT": "#52525b", "ACCENT_HOVER": "#27272a",
+        "LIVE_COLOR": "#16a34a", "LIVE_TEXT": "#15803d",
+        "BOOST_COLOR": "#d97706", "BOOST_TEXT": "#b45309",
+        "MUTED_COLOR": "#dc2626", "MUTE_TEXT": "#b91c1c",
+        "THUMB": "#ffffff", "TREE_LINE": "rgba(0, 0, 0, 0.34)",
+        "SHADOW": "0.28", "KNOB": "#27272a", "KNOB_ICON": "#ffffff",
+    },
+}
+DEFAULT_THEME = "dark"
+WINDOW_RADIUS = 9          # как geometry-corner-radius в window-rule niri
+
+# Сколько цветов плиток-заглушек (сами цвета — в CSS, классы tile-0…tile-7)
+TILE_COUNT = 8
+
+
+def build_css(theme):
+    """CSS для выбранной темы: все цвета берутся из словаря THEMES по имени."""
+    t = THEMES.get(theme) or THEMES[DEFAULT_THEME]
+    FG, NAME_FG, SURFACE_BG = t["FG"], t["NAME_FG"], t["SURFACE_BG"]
+    CARD_BG, CARD_HOVER, MASTER_BG = t["CARD_BG"], t["CARD_HOVER"], t["MASTER_BG"]
+    CHILD_BG, CHILD_HOVER = t["CHILD_BG"], t["CHILD_HOVER"]
+    ACCENT, ACCENT_HOVER = t["ACCENT"], t["ACCENT_HOVER"]
+    LIVE_COLOR, LIVE_TEXT = t["LIVE_COLOR"], t["LIVE_TEXT"]
+    BOOST_COLOR, BOOST_TEXT = t["BOOST_COLOR"], t["BOOST_TEXT"]
+    MUTED_COLOR, MUTE_TEXT = t["MUTED_COLOR"], t["MUTE_TEXT"]
+    THUMB, TREE_LINE, SHADOW = t["THUMB"], t["TREE_LINE"], t["SHADOW"]
+    KNOB, KNOB_ICON = t["KNOB"], t["KNOB_ICON"]
+    return f"""
+/* Фон задаём только самому окну: у него уже есть скругление. Квадратные
+   подложки внутри (toolbarview, шапка) вылезали за скруглённые углы. */
+window.mixer-win {{
+    background-color: {SURFACE_BG};
+}}
+/* niri режет окно по своему радиусу (geometry-corner-radius 9) — делаем такой
+   же и убираем тень и обводку libadwaita, иначе в углах остаётся «ступенька» */
+window.mixer-win,
+window.mixer-win.csd,
+window.mixer-win.csd:backdrop {{
+    border-radius: {WINDOW_RADIUS}px;
+    box-shadow: none;
+    outline: none;
+}}
+window.mixer-win toolbarview,
+window.mixer-win scrolledwindow,
+window.mixer-win viewport {{
+    background-color: transparent;
+}}
+window.mixer-win headerbar {{
+    background-color: transparent;
+    box-shadow: none;
+    border-bottom: 1px solid alpha({FG}, 0.08);
+}}
+/* подписи шапки не должны блёкнуть, когда окно не в фокусе */
+window.mixer-win headerbar,
+window.mixer-win headerbar:backdrop {{ color: {NAME_FG}; }}
+window.mixer-win headerbar > *,
+window.mixer-win headerbar:backdrop > * {{ opacity: 1; }}
+window.mixer-win headerbar .title,
+window.mixer-win headerbar:backdrop .title {{ font-weight: 700; color: {NAME_FG}; opacity: 1; }}
+window.mixer-win headerbar .subtitle,
+window.mixer-win headerbar:backdrop .subtitle {{
+    font-size: 11.5px;
+    color: alpha({FG}, 0.66);
+    opacity: 1;
+}}
+window.mixer-win windowcontrols button,
+window.mixer-win windowcontrols:backdrop button {{ color: alpha({FG}, 0.72); opacity: 1; }}
+
+/* ── карточка: приложение + его источники склеены в одну группу ───────────── */
+row.mixer-row {{
+    background-color: {CARD_BG};
+    border-radius: 12px;
+    margin: 0 0 8px 0;
+    transition: background-color 150ms ease-out, box-shadow 150ms ease-out;
+}}
+row.mixer-row.g-head {{ border-radius: 12px 12px 0 0; margin-bottom: 0; }}
+row.mixer-row.g-mid  {{ border-radius: 0; margin-bottom: 0; }}
+row.mixer-row.g-tail {{ border-radius: 0 0 12px 12px; }}
+row.mixer-row.child  {{ border-top: 1px solid alpha({FG}, 0.05); }}
+row.mixer-row:hover  {{ background-color: {CARD_HOVER}; }}
+row.mixer-row.live   {{ box-shadow: inset 3px 0 0 {LIVE_COLOR}; }}
+row.mixer-row:focus-within {{ box-shadow: inset 0 0 0 2px alpha({ACCENT_HOVER}, 0.7); }}
+row.mixer-row.live:focus-within {{
+    box-shadow: inset 3px 0 0 {LIVE_COLOR}, inset 0 0 0 2px alpha({ACCENT_HOVER}, 0.7);
+}}
+
+/* ── плитка приложения (иконка или первая буква) ───────────────────────── */
+.mixer-tile {{
+    min-width: 34px;
+    min-height: 34px;
+    border-radius: 9px;
+    background-color: alpha({FG}, 0.07);
+}}
+.mixer-tile.has-icon {{ background-color: transparent; }}
+.mixer-tile-letter {{
+    font-weight: 800;
+    font-size: 15px;
+    color: #ffffff;
+}}
+.tile-0 {{ background-color: #52525b; }}
+.tile-1 {{ background-color: #6b7280; }}
+.tile-2 {{ background-color: #57534e; }}
+.tile-3 {{ background-color: #4b5563; }}
+.tile-4 {{ background-color: #78716c; }}
+.tile-5 {{ background-color: #5b6470; }}
+.tile-6 {{ background-color: #64645f; }}
+.tile-7 {{ background-color: #6f6a66; }}
+
+/* ── имя, подпись, индикатор «звучит» ──────────────────────────────────── */
+.mixer-name {{ font-weight: 650; font-size: 13.5px; color: {NAME_FG}; }}
+.mixer-sub  {{ font-size: 11.5px; color: alpha({FG}, 0.60); opacity: 1; }}
+.live-dot {{
+    min-width: 7px;
+    min-height: 7px;
+    border-radius: 999px;
+    background-color: {LIVE_COLOR};
+    animation: live-pulse 2200ms ease-in-out infinite;
+}}
+@keyframes live-pulse {{
+    0%   {{ opacity: 1.0; }}
+    50%  {{ opacity: 0.35; }}
+    100% {{ opacity: 1.0; }}
+}}
+
+/* ── бейдж со значением ────────────────────────────────────────────────── */
+.mixer-value {{
+    font-size: 12.5px;
+    font-weight: 700;
+    font-feature-settings: "tnum";
+    padding: 0 9px;
+    min-width: 46px;
+    min-height: 24px;
+    border-radius: 999px;
+    color: alpha({FG}, 0.82);
+    background-color: alpha({FG}, 0.07);
+    transition: background-color 150ms ease-out, color 150ms ease-out;
+}}
+row.mixer-row.live .mixer-value {{
+    background-color: alpha({LIVE_COLOR}, 0.16);
+    color: {LIVE_TEXT};
+}}
+row.mixer-row.boost .mixer-value {{
+    background-color: alpha({BOOST_COLOR}, 0.18);
+    color: {BOOST_TEXT};
+}}
+row.mixer-row.muted .mixer-value {{
+    background-color: alpha({MUTED_COLOR}, 0.18);
+    color: {MUTE_TEXT};
+}}
+
+/* ── кнопка мьюта ──────────────────────────────────────────────────────── */
+button.mixer-mute {{
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+    border-radius: 999px;
+    background-color: transparent;
+    color: alpha({FG}, 0.62);
+    transition: background-color 150ms ease-out, color 150ms ease-out;
+}}
+button.mixer-mute:hover {{
+    background-color: alpha({FG}, 0.09);
+    color: {NAME_FG};
+}}
+button.mixer-mute:checked {{
+    background-color: alpha({MUTED_COLOR}, 0.18);
+    color: {MUTE_TEXT};
+}}
+button.mixer-mute:focus-visible {{ outline: 2px solid alpha({ACCENT_HOVER}, 0.8); outline-offset: 1px; }}
+
+/* ── слайдер: тонкая дорожка, заливка, круглый бегунок ─────────────────── */
+scale.mixer > trough {{
+    min-height: 6px;
+    border-radius: 999px;
+    background-color: alpha({FG}, 0.10);
+}}
+scale.mixer > trough > highlight {{
+    min-height: 6px;
+    border-radius: 999px;
+    background-color: {ACCENT};
+}}
+scale.mixer.boost > trough > highlight {{ background-color: {BOOST_COLOR}; }}
+scale.mixer.muted > trough > highlight {{ background-color: alpha({FG}, 0.28); }}
+scale.mixer > trough > slider {{
+    min-width: 16px;
+    min-height: 16px;
+    margin: -5px;
+    border: 3px solid {CARD_BG};
+    border-radius: 999px;
+    background-color: {THUMB};
+    box-shadow: 0 1px 4px alpha(black, {SHADOW});
+}}
+scale.mixer > trough > slider:hover {{ background-color: {THUMB}; }}
+scale.mixer > marks {{ color: alpha({FG}, 0.30); }}
+scale.mixer:focus-visible > trough {{ box-shadow: 0 0 0 2px alpha({ACCENT_HOVER}, 0.7); }}
+
+/* ── дерево: ствол и «отвод» к вложенному источнику ────────────────────── */
+.tree-top {{
+    min-width: 22px;
+    border-left: 2px solid {TREE_LINE};
+    border-bottom: 2px solid {TREE_LINE};
+    border-bottom-left-radius: 9px;
+}}
+.tree-bottom {{
+    min-width: 22px;
+    border-left: 2px solid {TREE_LINE};
+}}
+.tree-bottom.last {{ border-left-color: transparent; }}
+.tree-stub {{
+    min-width: 2px;
+    min-height: 14px;
+    background-color: {TREE_LINE};
+}}
+row.mixer-row.child {{ background-color: {CHILD_BG}; }}
+row.mixer-row.child:hover {{ background-color: {CHILD_HOVER}; }}
+list.mixer-list {{ background-color: transparent; }}
+row.mixer-row.child .mixer-name {{ font-size: 12.5px; font-weight: 600; }}
+row.mixer-row.child .mixer-tile {{
+    min-width: 26px;
+    min-height: 26px;
+    border-radius: 7px;
+}}
+row.mixer-row.child .mixer-tile-letter {{ font-size: 12px; }}
+
+/* ── кнопка выбора выхода (подпись под «Общая громкость») ──────────────── */
+button.output-button {{
+    padding: 0 4px 0 0;
+    margin: 0;
+    min-height: 0;
+    min-width: 0;
+    border-radius: 6px;
+    background-color: transparent;
+    box-shadow: none;
+    color: alpha({FG}, 0.60);
+}}
+button.output-button:hover {{ background-color: alpha({FG}, 0.08); color: {NAME_FG}; }}
+button.output-action {{ min-width: 26px; min-height: 26px; padding: 0; border-radius: 999px; }}
+
+/* ── общая громкость выхода ────────────────────────────────────────────── */
+.master-card {{
+    background-color: {MASTER_BG};
+    border: 1px solid alpha({FG}, 0.08);
+    border-radius: 12px;
+    margin-bottom: 14px;
+}}
+.master-card .mixer-name {{ font-size: 14px; }}
+.master-card .master-icon {{ color: alpha({FG}, 0.85); }}
+.master-card.muted .mixer-value {{
+    background-color: alpha({MUTED_COLOR}, 0.18);
+    color: {MUTE_TEXT};
+}}
+.master-card.boost .mixer-value {{
+    background-color: alpha({BOOST_COLOR}, 0.18);
+    color: {BOOST_TEXT};
+}}
+
+/* ── заголовки разделов и кнопка «служебные» ───────────────────────────── */
+.mixer-section {{
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.09em;
+    color: alpha({FG}, 0.60);
+}}
+window.mixer-win separator {{ background-color: alpha({FG}, 0.07); }}
+/* Все кнопки шапки — одна высота (28 px) и одна форма (пилюля) */
+window.mixer-win headerbar button,
+window.mixer-win headerbar windowcontrols button {{
+    min-height: 28px;
+    min-width: 28px;
+    padding: 0;
+    margin: 0;
+    border-radius: 999px;
+}}
+window.mixer-win headerbar button.system-toggle,
+window.mixer-win headerbar button.system-toggle:backdrop {{
+    min-width: 0;
+    padding: 0 14px;
+    font-size: 12.5px;
+    font-weight: 600;
+    background-color: alpha({FG}, 0.08);
+    box-shadow: inset 0 0 0 1px alpha({FG}, 0.10);
+    color: {NAME_FG};
+    opacity: 1;
+}}
+window.mixer-win headerbar button.system-toggle:hover {{ background-color: alpha({FG}, 0.13); }}
+window.mixer-win headerbar button.system-toggle:checked {{
+    background-color: alpha({FG}, 0.22);
+    color: {NAME_FG};
+}}
+window.mixer-win headerbar windowcontrols button {{ margin-left: 4px; }}
+
+/* ── переключатель темы (солнце / луна) ────────────────────────────────── */
+switch.theme-switch {{
+    min-width: 54px;
+    min-height: 28px;
+    padding: 0;
+    border: none;
+    border-radius: 999px;
+    background-image: none;
+    background-color: alpha({FG}, 0.12);
+    box-shadow: inset 0 0 0 1px alpha({FG}, 0.10);
+    outline: none;
+    transition: background-color 180ms ease-out;
+}}
+switch.theme-switch:checked {{ background-color: alpha({FG}, 0.12); }}
+switch.theme-switch:focus-visible {{ box-shadow: 0 0 0 2px alpha({ACCENT_HOVER}, 0.7); }}
+switch.theme-switch > slider {{
+    min-width: 22px;
+    min-height: 22px;
+    margin: 3px;
+    border-radius: 999px;
+    border: none;
+    background-image: none;
+    background-color: {KNOB};
+    box-shadow: 0 1px 3px alpha(black, {SHADOW});
+}}
+.theme-icon {{ color: alpha({FG}, 0.55); }}
+.theme-icon.on-knob {{ color: {KNOB_ICON}; }}
+"""
+
+
+CSS_INSTALLED = False
+
+
+def theme_icon_exists(name):
+    """Есть ли такая иконка в системной теме (иначе рисуем плитку с буквой)."""
+    if not name:
+        return False
+    try:
+        display = Gdk.Display.get_default()
+        if display is None:
+            return False
+        return bool(Gtk.IconTheme.get_for_display(display).has_icon(name))
+    except Exception:
+        return False
+
+
+CSS_PROVIDER = None
+
+
+def apply_theme(name):
+    """Переключает тему: цветовая схема libadwaita и наш CSS."""
+    global CSS_PROVIDER
+    display = Gdk.Display.get_default()
+    if display is None:
+        return
+    Adw.StyleManager.get_default().set_color_scheme(
+        Adw.ColorScheme.FORCE_LIGHT if name == "light" else Adw.ColorScheme.FORCE_DARK)
+    if CSS_PROVIDER is None:
+        CSS_PROVIDER = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(
+            display, CSS_PROVIDER, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    CSS_PROVIDER.load_from_string(build_css(name))
+
+
+def install_css():
+    """Подключает наш CSS поверх темы (тема запоминается в ui.json)."""
+    global CSS_INSTALLED
+    if CSS_INSTALLED:
+        return
+    apply_theme(load_ui().get("theme") or DEFAULT_THEME)
+    CSS_INSTALLED = True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Переводы: ключ — русская строка из исходника, файлы — locales/<код>.json
+# ─────────────────────────────────────────────────────────────────────────────
+
+LOCALES_DIR = BASE_DIR / "locales"
+# код → название языка на нём самом (в меню языки подписаны своими именами)
+LANGUAGES = [
+    ("ru", "Русский"), ("en", "English"), ("de", "Deutsch"), ("fr", "Français"),
+    ("es", "Español"), ("it", "Italiano"), ("pt", "Português"), ("pl", "Polski"),
+    ("uk", "Українська"), ("tr", "Türkçe"), ("zh", "简体中文"), ("ja", "日本語"),
+    ("ko", "한국어"),
+]
+_I18N = {"code": "ru", "table": {}}
+
+
+def available_languages():
+    """Языки, для которых есть файл перевода (русский — исходный, файла не нужно)."""
+    return [(c, n) for c, n in LANGUAGES
+            if c == "ru" or (LOCALES_DIR / ("%s.json" % c)).exists()]
+
+
+def resolve_lang(pref):
+    """Код языка интерфейса: выбранный пользователем либо язык системы."""
+    codes = [c for c, _ in available_languages()]
+    if pref and pref != "auto" and pref in codes:
+        return pref
+    for name in GLib.get_language_names():          # учитывает LANGUAGE, LC_ALL, LANG
+        base = re.split(r"[_.@-]", name)[0].lower()
+        if base in codes:
+            return base
+    return "en" if "en" in codes else "ru"
+
+
+def set_language(code):
+    table = {}
+    if code != "ru":
+        try:
+            data = json.loads((LOCALES_DIR / ("%s.json" % code)).read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                table = {k: v for k, v in data.items() if isinstance(v, str) and v}
+        except Exception:
+            table = {}
+    _I18N["code"], _I18N["table"] = code, table
+
+
+def tr(text):
+    """Строка интерфейса на выбранном языке (нет перевода — остаётся русская)."""
+    return _I18N["table"].get(text, text)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Запуск внешних команд
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run(args, timeout=10):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+
+
+def pactl_json(what):
+    r = run(["pactl", "-f", "json", "list", what])
+    if not r or r.returncode != 0:
+        return []
+    try:
+        return json.loads(r.stdout)
+    except Exception:
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Память о громкости: наша + wireplumber'овская
+# ─────────────────────────────────────────────────────────────────────────────
+
+def wp_unescape(s):
+    """WirePlumber кодирует ключи: пробел -> \\s, '[' -> \\o, ']' -> \\c."""
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            nxt = s[i + 1]
+            out.append({"s": " ", "o": "[", "c": "]", "n": "\n", "t": "\t"}.get(nxt, nxt))
+            i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+_wp_cache = {"mtime": None, "table": {}}
+
+# «Паспорт» приложения в аудиосервере: по этим свойствам WirePlumber узнаёт
+# приложение и запоминает его громкость. У обычных программ это application.name,
+# а, например, mpv ставит только application.id.
+IDENT_KEYS = ("application.name", "application.id")
+
+
+def wp_percent(data):
+    """Процент из записи WirePlumber.
+
+    В файле лежат два значения: «мягкая» громкость (volume) и канальная
+    (channelVolumes) в линейной амплитуде. Микшеры (pactl, pavucontrol) и мы
+    показываем канальную в кубической шкале, мягкую не учитываем — иначе одно и
+    то же приложение в разных программах выглядело бы по-разному.
+    """
+    try:
+        hard = max(data.get("channelVolumes") or [1.0])
+        return int(round(hard ** (1.0 / 3.0) * 100))
+    except Exception:
+        return None
+
+
+def wp_remembered():
+    """{"application.name:mpv": процент} из состояния WirePlumber (кэш по mtime)."""
+    try:
+        mtime = WP_PROPS.stat().st_mtime
+    except OSError:
+        return {}
+    if _wp_cache["mtime"] == mtime:
+        return _wp_cache["table"]
+
+    table, head = {}, "Output/Audio:"
+    try:
+        text = WP_PROPS.read_text(errors="replace")
+    except OSError:
+        return {}
+    for line in text.splitlines():
+        if not line.startswith(head):
+            continue
+        key, _, val = line.partition("=")
+        key = key[len(head):]
+        if not key.startswith(IDENT_KEYS):
+            continue
+        try:
+            pct = wp_percent(json.loads(val))
+        except Exception:
+            continue
+        if pct is not None:
+            table[wp_unescape(key)] = pct
+    _wp_cache["mtime"], _wp_cache["table"] = mtime, table
+    return table
+
+
+def wp_lookup(table, ident):
+    """Громкость из памяти WirePlumber по «паспорту» приложения."""
+    for key, val in ident.items():
+        pct = table.get("%s:%s" % (key, val))
+        if pct is not None:
+            return pct
+    return None
+
+
+def load_store():
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        if isinstance(data, dict):
+            data.setdefault("volumes", {})
+            data.setdefault("prev", {})
+            data.setdefault("ident", {})
+            return data
+    except Exception:
+        pass
+    return {"volumes": {}, "prev": {}, "ident": {}}
+
+
+def save_store(store):
+    try:
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(store, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+
+
+def load_ui():
+    """Настройки окна (переживают перезапуск)."""
+    try:
+        data = json.loads(UI_FILE.read_text())
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_ui(data):
+    try:
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        UI_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Фантомный поток — задать громкость молчащему приложению
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ensure_silence():
+    try:
+        if SILENCE.exists() and SILENCE.stat().st_size > 1000:
+            return True
+    except OSError:
+        pass
+    try:
+        import wave
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        frames = int(48000 * PHANTOM_MS / 1000)
+        with wave.open(str(SILENCE), "wb") as w:
+            w.setnchannels(2)
+            w.setsampwidth(2)
+            w.setframerate(48000)
+            w.writeframes(b"\x00\x00\x00\x00" * frames)
+        return True
+    except Exception:
+        return False
+
+
+def phantom(ident, pct):
+    """Задать громкость молчащему приложению.
+
+    В аудиосервере у молчащего приложения нет потока, поэтому создаём свой
+    беззвучный поток с тем же «паспортом» — WirePlumber запоминает громкость под
+    ним и применит её, когда приложение зазвучит. Работает в отдельном процессе:
+    создать поток, дождаться его появления и выставить громкость через pactl —
+    ровно так же, как для звучащего приложения.
+    """
+    if not ensure_silence():
+        return
+    args = [sys.executable, os.path.abspath(__file__), "--phantom", str(max(0, pct))]
+    for key, val in ident.items():
+        if val:
+            args.append("%s=%s" % (key, val))
+    try:
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception:
+        pass
+
+
+def phantom_worker(pct, items):
+    """Процесс-помощник: беззвучный поток + громкость живому потоку."""
+    ident = {}
+    for item in items:
+        key, _, val = item.partition("=")
+        if key in IDENT_KEYS and val:
+            ident[key] = val
+    if not ident:
+        return 1
+    props = "{ " + " ".join(
+        "%s=%s" % (k, json.dumps(v, ensure_ascii=False)) for k, v in ident.items()
+    ) + " " + PHANTOM_MARK + "=true }"
+    try:
+        proc = subprocess.Popen(
+            ["pw-cat", "--playback", "-P", props, str(SILENCE)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        return 1
+    for _ in range(40):
+        time.sleep(0.03)
+        for si in pactl_json("sink-inputs"):
+            p = si.get("properties") or {}
+            if str(p.get(PHANTOM_MARK)) not in ("true", "True", "1"):
+                continue
+            if all(str(p.get(k)) == v for k, v in ident.items()):
+                run(["pactl", "set-sink-input-volume", str(si["index"]), "%d%%" % max(0, pct)])
+                return 0
+        if proc.poll() is not None:
+            break
+    return 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Разбор процессов
+# ─────────────────────────────────────────────────────────────────────────────
+
+def proc_ppid(pid):
+    try:
+        stat = Path("/proc/%s/stat" % pid).read_text()
+        return int(stat[stat.rindex(")") + 2:].split()[1])
+    except Exception:
+        return 0
+
+
+def proc_chain(pid, depth=32):
+    """Цепочка родительских pid вверх (ближайшие первыми)."""
+    chain, cur = [], pid
+    for _ in range(depth):
+        ppid = proc_ppid(cur)
+        if ppid <= 1:
+            break
+        chain.append(ppid)
+        cur = ppid
+    return chain
+
+
+def proc_hint(pid, binary):
+    """Человекочитаемое имя для процессов вида python (Anki и подобные)."""
+    if not pid:
+        return ""
+    if binary.startswith(("python", "pypy")):
+        # 1) скрипт в аргументах командной строки
+        try:
+            parts = [p for p in Path("/proc/%s/cmdline" % pid).read_bytes().split(b"\0") if p]
+            for p in parts[1:]:
+                s = p.decode(errors="replace")
+                if s.startswith("-"):
+                    continue
+                base = os.path.basename(s)
+                if base.endswith((".py", ".pyw")):
+                    return os.path.splitext(base)[0]
+        except Exception:
+            pass
+        # 2) имя процесса-обёртки (например /usr/bin/anki)
+        for anc in proc_chain(pid, depth=3):
+            try:
+                comm = Path("/proc/%d/comm" % anc).read_text().strip()
+            except Exception:
+                continue
+            if comm and not comm.startswith(("python", "sh", "bash", "systemd")):
+                return comm
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Сбор списка приложений
+# ─────────────────────────────────────────────────────────────────────────────
+
+def stream_volume(si):
+    for ch in (si.get("volume") or {}).values():
+        pct = ch.get("value_percent")
+        if pct:
+            try:
+                return int(float(pct.rstrip("%")))
+            except ValueError:
+                pass
+    return 100
+
+
+def is_generic_binary(binary):
+    """Обёртка ли это («python3.14» — тоже обёртка, поэтому срезаем версию)."""
+    b = (binary or "").lower()
+    if b in GENERIC_BINARIES:
+        return True
+    m = GENERIC_VERSION_RE.match(b)
+    return bool(m and m.group(1) in GENERIC_BINARIES)
+
+
+def own_tool(pid):
+    """Наш собственный помощник (pw-cat «фантома»): его в списке быть не должно.
+
+    Процесс беззвучного потока запускает сам микшер, поэтому в его командной
+    строке есть «appmixer» — по ней и отличаем его от чужого pw-cat.
+    """
+    try:
+        return b"appmixer" in Path("/proc/%s/cmdline" % pid).read_bytes()
+    except OSError:
+        return False
+
+
+def client_label(name, binary, pid):
+    """Человекочитаемая подпись приложения (используется и как ключ группировки).
+
+    Для обёрток (pw-cat, python, electron и т.п.) подпись берём из
+    application.name, иначе — из имени исполняемого файла.
+    """
+    hint = proc_hint(pid, binary)
+    if hint:
+        return hint[:1].upper() + hint[1:]
+    b = binary.lower()
+    if b and not is_generic_binary(b):
+        return PRETTY_BINARY.get(b) or binary
+    return PRETTY_BINARY.get(name.lower()) or name
+
+
+def snapshot_procs():
+    """Срез процессов: {pid: {"comm": имя, "ppid": родитель}}.
+
+    Для скриптов с шебангом comm — имя самого скрипта: у Anki это «anki», хотя
+    реально запущен python3.14. Именно это и нужно, чтобы строить дерево.
+    """
+    procs = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return procs
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            stat = Path("/proc/%s/stat" % entry).read_text()
+        except OSError:
+            continue
+        cut = stat.rindex(")")
+        try:
+            procs[int(entry)] = {
+                "comm": stat[stat.index("(") + 1:cut],
+                "ppid": int(stat[cut + 2:].split()[1]),
+            }
+        except (ValueError, IndexError):
+            continue
+    return procs
+
+
+def is_ignored(comm):
+    """Через такие процессы дерево не строим: оболочки, терминалы, сессия.
+
+    Благодаря этому mpv, запущенный из терминала, остаётся сам себе корнем, а
+    mpv, которого запустил Anki (anki → mpv), вкладывается в Anki.
+    """
+    c = (comm or "").lower()
+    if not c:
+        return True
+    if c in IGNORE_COMM:
+        return True
+    m = GENERIC_VERSION_RE.match(c)
+    return bool(m and m.group(1) in IGNORE_COMM)
+
+
+def media_catalog():
+    """Бинарники, которые умеют издавать звук (их показываем и молчащими)."""
+    cat = set(MEDIA_BINARIES) | set(PRETTY_BINARY) | set(ICON_BY_BINARY)
+    for binaries in (load_store().get("known") or {}).values():
+        cat.update(str(b).lower() for b in binaries)
+    return cat
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Установленные приложения (.desktop): настоящие имена и настоящие иконки
+# ─────────────────────────────────────────────────────────────────────────────
+
+DESKTOP_DIRS = (
+    Path.home() / ".local/share/applications",
+    Path("/usr/local/share/applications"),
+    Path("/usr/share/applications"),
+    Path.home() / ".local/share/flatpak/exports/share/applications",
+    Path("/var/lib/flatpak/exports/share/applications"),
+    Path.home() / ".local/share/snapd/desktop/applications",
+    Path("/var/lib/snapd/desktop/applications"),
+)
+
+# «обёртки» перед самой программой в Exec=…: их имена ничего не значат
+EXEC_WRAPPERS = {
+    "env", "flatpak", "snap", "setsid", "nohup", "sh", "bash", "exec",
+    "dbus-run-session", "gamemoderun", "prime-run", "mangohud", "systemd-run",
+    "wine", "python3", "python", "node",
+}
+
+_DESKTOP_CACHE = {"stamp": None, "apps": {}, "checked": 0.0}
+
+
+def _desktop_field(text, key):
+    """Значение ключа из секции [Desktop Entry] (в файлах бывает всякое)."""
+    inside = False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("["):
+            inside = s == "[Desktop Entry]"
+            continue
+        if not inside or "=" not in s or s.startswith("#"):
+            continue
+        k, _, v = s.partition("=")
+        if k.strip() == key:
+            return v.strip().strip('"')
+    return ""
+
+
+def _exec_binary(exec_line):
+    """Из Exec=… берём имя программы без аргументов и без обёрток."""
+    try:
+        toks = shlex.split(exec_line)
+    except ValueError:
+        toks = exec_line.split()
+    for tok in toks:
+        if not tok or tok.startswith(("-", "@", "%")):
+            continue
+        base = os.path.basename(tok).lower()
+        if base in EXEC_WRAPPERS or "=" in tok:
+            continue
+        return base
+    return ""
+
+
+def desktop_apps():
+    """{ключ: {"name": …, "icon": …}} по установленным .desktop-файлам.
+
+    Иконку и имя берём ровно те, что показывают в меню приложений, — тогда в
+    микшере видно узнаваемую иконку, а не «первую букву на квадратике».
+    """
+    # Файлы перечитываем редко: список меняется только при установке программ,
+    # а вызывается это на каждую строку и каждый поток.
+    now = time.monotonic()
+    if _DESKTOP_CACHE["apps"] and now - _DESKTOP_CACHE["checked"] < 5.0:
+        return _DESKTOP_CACHE["apps"]
+    _DESKTOP_CACHE["checked"] = now
+
+    files = []
+    for d in DESKTOP_DIRS:
+        try:
+            for f in d.glob("*.desktop"):
+                try:
+                    files.append((f, f.stat().st_mtime_ns))
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    files.sort(key=lambda x: str(x[0]))
+    stamp = tuple((str(f), m) for f, m in files)
+    if stamp == _DESKTOP_CACHE["stamp"]:
+        return _DESKTOP_CACHE["apps"]
+
+    apps = {}
+    for f, _ in files:
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        if _desktop_field(text, "Type") not in ("", "Application"):
+            continue
+        if _desktop_field(text, "Hidden").lower() == "true":
+            continue
+        name, icon = _desktop_field(text, "Name"), _desktop_field(text, "Icon")
+        if not name or not icon:
+            continue
+        entry = {"name": name, "icon": icon}
+        for cand in (_exec_binary(_desktop_field(text, "Exec")),
+                     _desktop_field(text, "StartupWMClass").lower(),
+                     f.name[:-len(".desktop")].lower(),
+                     name.lower()):
+            if cand:
+                apps.setdefault(cand, entry)
+    _DESKTOP_CACHE["stamp"], _DESKTOP_CACHE["apps"] = stamp, apps
+    return apps
+
+
+def desktop_lookup(*candidates):
+    """Приложение по имени бинарника / классу окна / названию."""
+    apps = desktop_apps()
+    for cand in candidates:
+        c = str(cand or "").lower()
+        if not c:
+            continue
+        hit = apps.get(c)
+        if hit:
+            return hit
+        m = GENERIC_VERSION_RE.match(c)
+        if m and apps.get(m.group(1)):
+            return apps[m.group(1)]
+    return ""
+
+
+def resolve_icon(icon):
+    """Иконка темы или файл по абсолютному пути — что реально существует."""
+    if not icon:
+        return ""
+    if icon.startswith("/"):
+        return icon if os.path.exists(icon) else ""
+    return icon if theme_icon_exists(icon) else ""
+
+
+def dump_streams():
+    """Кто на самом деле держит поток: {index: {"name","binary","pid"}}.
+
+    pactl для части потоков (уведомления quickshell, «Playback Stream» из
+    Telegram и подобные) не показывает ни имени, ни процесса. В полном дампе
+    PipeWire такой поток ссылается на объект-владельца (client.id), а у того
+    уже есть application.name, application.process.id и pipewire.sec.pid —
+    по ним и находим приложение.
+    """
+    r = run(["pw-dump"], timeout=15)
+    if not r or r.returncode != 0:
+        return {}
+    try:
+        objs = json.loads(r.stdout)
+    except Exception:
+        return {}
+
+    props_by_id = {}
+    for o in objs:
+        props_by_id[o.get("id")] = (o.get("info") or {}).get("props") or {}
+
+    def first(sources, *keys):
+        for src in sources:
+            for k in keys:
+                v = src.get(k)
+                if v:
+                    return str(v)
+        return ""
+
+    out = {}
+    for o in objs:
+        own = (o.get("info") or {}).get("props") or {}
+        if own.get("media.class") != "Stream/Output/Audio":
+            continue
+        # владелец потока: объект, на который указывает client.id (это может
+        # быть и клиент, и узел-обёртка — поэтому смотрим по всем объектам)
+        owner = {}
+        try:
+            owner = props_by_id.get(int(own.get("client.id"))) or {}
+        except (TypeError, ValueError):
+            owner = {}
+        srcs = (own, owner)
+
+        info = {
+            "name": first(srcs, "application.name", "application.id"),
+            "binary": first(srcs, "application.process.binary"),
+            "pid": 0,
+        }
+        # Сначала настоящий pid приложения. Если его нет — берём владельца
+        # соединения (pipewire.sec.pid), но только когда это не сам аудиосервер:
+        # клиенты, созданные через pipewire-pulse, «принадлежат» ему, а не
+        # приложению, и по ним мы бы подвязали поток не туда.
+        raw = first(srcs, "application.process.id")
+        if raw.isdigit():
+            info["pid"] = int(raw)
+        else:
+            raw = first(srcs, "pipewire.sec.pid")
+            if raw.isdigit():
+                owner_pid = int(raw)
+                comm = ""
+                try:
+                    comm = Path("/proc/%d/comm" % owner_pid).read_text().strip()
+                except OSError:
+                    comm = ""
+                if comm and not is_ignored(comm) and not comm.startswith("pipewire"):
+                    info["pid"] = owner_pid
+        for key in (str(o.get("id")), str(own.get("object.serial"))):
+            if key and key != "None":
+                out.setdefault(key, info)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Что именно играет: MPRIS (плееры, вкладки браузера) и имя потока (файлы mpv)
+# ─────────────────────────────────────────────────────────────────────────────
+
+GENERIC_MEDIA_NAMES = {
+    "", "playback", "audio stream", "playstream", "playback stream", "audio",
+    "stream", "output", "sound", "pipewire", "(null)", "chromium input", "brave input",
+}
+
+
+def mpris_players():
+    """Плееры на шине сессии: заголовок, статус и pid процесса-владельца."""
+    out = []
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        names = bus.call_sync(
+            "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+            "ListNames", None, GLib.VariantType("(as)"), Gio.DBusCallFlags.NONE,
+            300, None).unpack()[0]
+    except Exception:
+        return out
+    for name in names:
+        if not name.startswith("org.mpris.MediaPlayer2.") or name.endswith(".playerctld"):
+            continue
+        try:
+            props = bus.call_sync(
+                name, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties",
+                "GetAll", GLib.Variant("(s)", ("org.mpris.MediaPlayer2.Player",)),
+                GLib.VariantType("(a{sv})"), Gio.DBusCallFlags.NONE, 300, None).unpack()[0]
+            pid = bus.call_sync(
+                "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                "GetConnectionUnixProcessID", GLib.Variant("(s)", (name,)),
+                GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, 300, None).unpack()[0]
+        except Exception:
+            continue
+        meta = props.get("Metadata") or {}
+        title = str(meta.get("xesam:title") or "").strip()
+        artist = meta.get("xesam:artist") or []
+        if isinstance(artist, (list, tuple)):
+            artist = ", ".join(str(a) for a in artist if a)
+        out.append({"bus": name, "pid": int(pid), "status": str(props.get("PlaybackStatus") or ""),
+                    "title": title, "artist": str(artist or "").strip()})
+    return out
+
+
+def clean_media_name(name, label, binaries):
+    """Имя потока без служебных слов; пусто, если это не название звука."""
+    n = (name or "").strip()
+    if n.lower().endswith(" - mpv"):
+        n = n[:-6].strip()
+    low = n.lower()
+    if low in GENERIC_MEDIA_NAMES or low.startswith("alsa plugin"):
+        return ""
+    if low == (label or "").lower() or low in [str(b).lower() for b in binaries]:
+        return ""
+    return n
+
+
+def state_text(row):
+    """Подпись строки: отключено / название звука / молчит."""
+    if row["mute"]:
+        return tr("отключено")
+    if not row["live"]:
+        return tr("молчит")
+    title = row.get("title") or next(
+        (k["title"] for k in row["children"] if k["live"] and k.get("title")), "")
+    return title or tr("играет")
+
+
+def streams_active(streams):
+    """Есть ли поток, который реально играет (не на паузе)."""
+    return any(not si.get("corked") for si in streams)
+
+
+# Общая громкость текущего аудиовыхода (default sink)
+
+def master_info():
+    r = run(["pactl", "get-default-sink"])
+    name = r.stdout.strip() if r and r.returncode == 0 else ""
+    for sk in pactl_json("sinks"):
+        if sk.get("name") == name:
+            vol = 100
+            for ch in (sk.get("volume") or {}).values():
+                try:
+                    vol = int(float(str(ch.get("value_percent", "100%")).rstrip("%")))
+                    break
+                except ValueError:
+                    pass
+            return {"name": name, "label": sk.get("description") or name,
+                    "volume": vol, "mute": bool(sk.get("mute"))}
+    return None
+
+
+def master_set_volume(pct):
+    run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "%d%%" % pct])
+
+
+def master_set_mute(muted):
+    run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1" if muted else "0"])
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Выходы: список, скрытие «мёртвых», переключение на следующий, хоткей
+# ─────────────────────────────────────────────────────────────────────────────
+
+OUTPUTS_FILE = CONF_DIR / "outputs.json"
+DEFAULT_HOTKEY = "<Control>XF86AudioMute"     # как был bind в niri
+
+
+def load_outputs_cfg():
+    cfg = {"hidden": [], "hotkey": DEFAULT_HOTKEY}
+    try:
+        data = json.loads(OUTPUTS_FILE.read_text())
+        if isinstance(data, dict):
+            if isinstance(data.get("hidden"), list):
+                cfg["hidden"] = [str(x) for x in data["hidden"]]
+            if "hotkey" in data:
+                cfg["hotkey"] = str(data["hotkey"] or "")
+    except Exception:
+        pass
+    return cfg
+
+
+def save_outputs_cfg(cfg):
+    try:
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        OUTPUTS_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+    except OSError:
+        pass
+
+
+def list_outputs():
+    """Все аудиовыходы: имя, подпись, «мёртвый» ли (ни одного подключённого порта),
+    выход по умолчанию, скрыт ли пользователем."""
+    r = run(["pactl", "get-default-sink"])
+    default = r.stdout.strip() if r and r.returncode == 0 else ""
+    hidden = set(load_outputs_cfg()["hidden"])
+    outs = []
+    for sk in pactl_json("sinks"):
+        ports = sk.get("ports") or []
+        dead = bool(ports) and all(p.get("availability") == "not available" for p in ports)
+        outs.append({
+            "name": sk.get("name", ""),
+            "label": sk.get("description") or sk.get("name", ""),
+            "dead": dead,
+            "default": sk.get("name") == default,
+            "hidden": sk.get("name") in hidden,
+        })
+    return outs
+
+
+def set_hidden(name, hide):
+    cfg = load_outputs_cfg()
+    hid = [h for h in cfg["hidden"] if h != name]
+    if hide:
+        hid.append(name)
+    cfg["hidden"] = hid
+    save_outputs_cfg(cfg)
+
+
+def hide_dead_outputs():
+    cfg = load_outputs_cfg()
+    for o in list_outputs():
+        if o["dead"] and o["name"] not in cfg["hidden"] and not o["default"]:
+            cfg["hidden"].append(o["name"])
+    save_outputs_cfg(cfg)
+
+
+def desktop_notify(body, title=None):
+    """Уведомление, если в системе есть notify-send (иначе тихо пропускаем)."""
+    exe = shutil.which("notify-send")
+    if exe:
+        run([exe, "-a", APP_TITLE, "-i", "audio-card", title or tr("Аудиовыход"), body], timeout=5)
+
+
+def switch_output(name):
+    """Сделать выход основным и перенести на него уже играющие потоки."""
+    run(["pactl", "set-default-sink", name])
+    r = run(["pactl", "list", "short", "sink-inputs"])
+    for line in (r.stdout.splitlines() if r and r.returncode == 0 else []):
+        idx = line.split("\t")[0]
+        if idx.isdigit():
+            run(["pactl", "move-sink-input", idx, name])
+
+
+def next_output(step=1, notify=True):
+    """Переключить на следующий (step=-1 — на предыдущий) доступный нескрытый выход."""
+    cands = [o for o in list_outputs() if not o["hidden"] and not o["dead"]]
+    cur = next((i for i, o in enumerate(cands) if o["default"]), -1)
+    others = [o for o in cands if not o["default"]]
+    if not others:
+        if notify:
+            desktop_notify(tr("Нет других доступных выходов"))
+        return None
+    target = cands[(cur + step) % len(cands)] if cur >= 0 else cands[0]
+    switch_output(target["name"])
+    if notify:
+        desktop_notify(target["label"])
+    return target
+
+
+# Сочетание хранится в формате GTK («<Control>XF86AudioMute»); для портала и
+# для niri его нужно перевести в их написание.
+def accel_parts(accel):
+    ok, keyval, mods = Gtk.accelerator_parse(accel or "")
+    if not ok or not keyval:
+        return None
+    name = Gdk.keyval_name(keyval)
+    if 0x1008FF00 <= keyval <= 0x1008FFFF and not name.startswith("XF86"):
+        name = "XF86" + name               # мультимедийные клавиши: в xkb они называются XF86…
+    return name, mods
+
+
+def accel_to_portal(accel):
+    parts = accel_parts(accel)
+    if not parts:
+        return ""
+    key, mods = parts
+    names = []
+    for flag, nm in ((Gdk.ModifierType.CONTROL_MASK, "CTRL"), (Gdk.ModifierType.SHIFT_MASK, "SHIFT"),
+                     (Gdk.ModifierType.ALT_MASK, "ALT"), (Gdk.ModifierType.SUPER_MASK, "LOGO")):
+        if mods & flag:
+            names.append(nm)
+    return "+".join(names + [key])
+
+
+def self_command():
+    return '"%s" --next-output' % (BASE_DIR / "appmixer")
+
+
+def run_daemon():
+    """Фоновый режим: глобальный хоткей через xdg-desktop-portal GlobalShortcuts.
+
+    Работает там, где компоновщик это поддерживает (KDE Plasma, GNOME 48+). В niri,
+    sway и Hyprland портал отказывает — тогда привяжите команду --next-output в
+    конфиге компоновщика (её показывает окно)."""
+    accel = load_outputs_cfg()["hotkey"]
+    trigger = accel_to_portal(accel)
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    loop = GLib.MainLoop()
+    sender = bus.get_unique_name()[1:].replace(".", "_")
+    state = {"sess": None, "ok": False}
+    PORTAL = ("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
+
+    def request(token, cb):
+        path = "/org/freedesktop/portal/desktop/request/%s/%s" % (sender, token)
+        bus.signal_subscribe(PORTAL[0], "org.freedesktop.portal.Request", "Response", path, None,
+                             Gio.DBusSignalFlags.NONE, cb, None)
+
+    def on_bound(conn, sname, path, iface, sig, params, _):
+        code, _res = params.unpack()
+        if code != 0:
+            print("портал не поддерживает глобальные сочетания в этом окружении "
+                  "(привяжите команду %s в конфиге компоновщика)" % self_command(), file=sys.stderr)
+            loop.quit()
+            return
+        state["ok"] = True
+        print("глобальный хоткей %s зарегистрирован" % trigger)
+
+    def on_session(conn, sname, path, iface, sig, params, _):
+        code, res = params.unpack()
+        if code != 0:
+            print("не удалось создать сессию GlobalShortcuts", file=sys.stderr)
+            loop.quit()
+            return
+        state["sess"] = res["session_handle"]
+        request("fgbind", on_bound)
+        shortcuts = [("next-output", {
+            "description": GLib.Variant("s", "Next audio output"),
+            "preferred_trigger": GLib.Variant("s", trigger)})]
+        bus.call_sync(PORTAL[0], PORTAL[1], "org.freedesktop.portal.GlobalShortcuts", "BindShortcuts",
+                      GLib.Variant("(oa(sa{sv})sa{sv})",
+                                   (state["sess"], shortcuts, "", {"handle_token": GLib.Variant("s", "fgbind")})),
+                      GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, 5000, None)
+
+    def on_activated(conn, sname, path, iface, sig, params, _):
+        if params.unpack()[1] == "next-output":
+            next_output()
+
+    if not trigger:
+        print("в настройках не задано сочетание клавиш", file=sys.stderr)
+        return 2
+    bus.signal_subscribe(PORTAL[0], "org.freedesktop.portal.GlobalShortcuts", "Activated",
+                         PORTAL[1], None, Gio.DBusSignalFlags.NONE, on_activated, None)
+    request("fgsession", on_session)
+    try:
+        bus.call_sync(PORTAL[0], PORTAL[1], "org.freedesktop.portal.GlobalShortcuts", "CreateSession",
+                      GLib.Variant("(a{sv})", ({"handle_token": GLib.Variant("s", "fgsession"),
+                                                "session_handle_token": GLib.Variant("s", "fgsess")},)),
+                      GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, 5000, None)
+    except Exception as exc:
+        print("портал GlobalShortcuts недоступен: %s" % exc, file=sys.stderr)
+        return 3
+    loop.run()
+    return 0 if state["ok"] else 3
+
+
+ALSA_NAME_RE = re.compile(r"^PipeWire ALSA \[(.+?)\]$")
+
+
+def collect():
+    """Дерево приложений: корень — приложение, дети — чем именно оно звучит.
+
+    Строка depth 0 — приложение (Anki), depth 1 — источник звука внутри него
+    (mpv). Один и тот же источник у разных приложений даёт разные строки: два
+    mpv под Anki и под своим софтом — это два отдельных ползунка.
+
+    Порядок строк стабильный (по алфавиту): от того, что сейчас звучит, он не
+    зависит, поэтому строки не перепрыгивают.
+    """
+    procs = snapshot_procs()
+    all_streams = pactl_json("sink-inputs")
+    clients = pactl_json("clients")
+    store, wp = load_store(), wp_remembered()
+
+    # ── 1) что известно аудиосерверу ────────────────────────────────────────
+    client_props, label_by_pid, binary_by_pid = {}, {}, {}
+    for c in clients:
+        p = c.get("properties") or {}
+        raw = str(p.get("application.process.id") or "")
+        pid = int(raw) if raw.isdigit() else 0
+        binary = p.get("application.process.binary") or ""
+        name = p.get("application.name") or p.get("application.id") or ""
+        if not (name or binary):
+            continue
+        if pid and (is_generic_binary(binary) or is_generic_binary(name)) and (
+                own_tool(pid) or pid not in procs):
+            # наш беззвучный поток (или его уже «остывший» клиент) — не приложение
+            continue
+        client_props[c["index"]] = p
+        if pid:
+            label_by_pid.setdefault(pid, client_label(name, binary, pid))
+            binary_by_pid.setdefault(pid, binary)
+
+    def label_of(pid):
+        """Как называть процесс: подпись клиента, красивое имя, имя из .desktop."""
+        if pid in label_by_pid:
+            return label_by_pid[pid]
+        comm = (procs.get(pid) or {}).get("comm", "")
+        pretty = PRETTY_BINARY.get(comm.lower())
+        if pretty:
+            return pretty          # «mpv» так и остаётся «mpv», а не «mpv Media Player»
+        desk = desktop_lookup(comm)
+        if desk:
+            return desk["name"]
+        return comm
+
+    def real_chain(pid):
+        """Предки процесса, через которые дерево строим (верхние/сессии отброшены)."""
+        out, cur = [], pid
+        for _ in range(32):
+            ppid = (procs.get(cur) or {}).get("ppid", 0)
+            if ppid <= 1:
+                break
+            cur = ppid
+            if not is_ignored((procs.get(cur) or {}).get("comm", "")):
+                out.append(cur)
+        return out
+
+    # ── 2) какие процессы вообще показываем ─────────────────────────────────
+    # С клиентом в аудиосервере — понятно. Плюс все, кто умеет издавать звук:
+    # mpv и подобные висят в трее молча, клиента у них в этот момент нет.
+    catalog = media_catalog()
+    interesting = set(label_by_pid)
+    for pid, info in procs.items():
+        comm = info["comm"].lower()
+        if is_ignored(comm):
+            continue      # обёртки и плееры-утилиты (pw-cat и т.п.) строками не делаем
+        hit = comm in catalog
+        if not hit:
+            m = GENERIC_VERSION_RE.match(comm)
+            hit = bool(m and m.group(1) in catalog)
+        if hit:
+            interesting.add(pid)
+
+    # ── 3) почему строка стоит там, где стоит ───────────────────────────────
+    # Верхний «настоящий» предок — корень приложения, сам процесс — источник
+    # звука внутри него. Если подписи совпали (Brave-рендерер и сам Brave), это
+    # одно и то же приложение — вкладывать нечего.
+    units = {}
+    for pid in interesting:
+        units[pid] = label_of(pid)
+    # Корень приложения заводим строкой, а промежуточных предков — нет: иначе
+    # обёртки вроде claude-desktop → disclaimer → claude превращались в ложную
+    # ветку «Claude / disclaimer» (ключевые процессы и так уже в units).
+    for pid in list(units):
+        chain = real_chain(pid)
+        if chain:
+            units.setdefault(chain[-1], label_of(chain[-1]))
+
+    for pid, label in units.items():
+        chain = real_chain(pid)
+        root = chain[-1] if chain else pid
+        if label_of(root) == label:
+            root = pid
+        if root == pid:
+            units[pid] = {"label": label, "root": pid, "parent": "", "key": label}
+        else:
+            root_label = label_of(root)
+            units[pid] = {"label": label, "root": root, "parent": root_label,
+                          "key": "%s/%s" % (root_label, label)}
+
+    groups = {}
+    for pid, u in units.items():
+        g = groups.setdefault(u["key"], {
+            "key": u["key"], "label": u["label"], "parent": u["parent"],
+            "depth": 1 if u["parent"] else 0,
+            "pids": set(), "names": set(), "binaries": set(),
+            "icons": [], "clients": set(), "streams": [],
+            "ident_client": {}, "ident_stream": {},
+        })
+        g["pids"].add(pid)
+        binary = binary_by_pid.get(pid) or (procs.get(pid) or {}).get("comm") or ""
+        if binary:
+            g["binaries"].add(binary)
+
+    def ident_add(bucket, props):
+        for key in IDENT_KEYS:
+            val = props.get(key)
+            if not val or ALSA_NAME_RE.match(str(val)):
+                continue          # «PipeWire ALSA [...]» — имя потока, не приложения
+            bucket.setdefault(key, set()).add(str(val))
+
+    for index, props in client_props.items():
+        raw = str(props.get("application.process.id") or "")
+        pid = int(raw) if raw.isdigit() else 0
+        binary = props.get("application.process.binary") or ""
+        name = props.get("application.name") or props.get("application.id") or ""
+        u = units.get(pid)
+        if u is None:
+            # клиент без процесса: заводим строку по его подписи
+            if not (name or binary):
+                continue
+            label = client_label(name, binary, pid)
+            u = {"label": label, "parent": "", "key": label}
+            units[pid or ("client%d" % index)] = u
+            groups.setdefault(label, {
+                "key": label, "label": label, "parent": "", "depth": 0,
+                "pids": set(), "names": set(), "binaries": set(),
+                "icons": [], "clients": set(), "streams": [],
+                "ident_client": {}, "ident_stream": {},
+            })
+        g = groups.get(u["key"])
+        if g is None:
+            continue
+        g["clients"].add(index)
+        ident_add(g["ident_client"], props)
+        if props.get("application.icon_name"):
+            g["icons"].append(props["application.icon_name"])
+        if binary:
+            g["binaries"].add(binary)
+        for key in IDENT_KEYS:
+            if props.get(key):
+                g["names"].add(str(props[key]))
+
+    # ── 4) раскладываем потоки по строкам ───────────────────────────────────
+    name_count, key_by_name, key_by_binary, key_by_client = {}, {}, {}, {}
+    for key, g in groups.items():
+        for n in g["names"]:
+            name_count[n] = name_count.get(n, 0) + 1
+            key_by_name.setdefault(n, []).append(key)
+        for b in g["binaries"]:
+            key_by_binary.setdefault(str(b).lower(), []).append(key)
+        for c in g["clients"]:
+            key_by_client[c] = key
+
+    def unique_name(value):
+        hits = key_by_name.get(value) or []
+        return hits[0] if len(hits) == 1 else None
+
+    def unique_binary(value):
+        hits = key_by_binary.get(str(value).lower()) or []
+        return hits[0] if len(hits) == 1 else None
+
+    # Полный дамп PipeWire нужен только для «безымянных» потоков, поэтому
+    # спрашиваем его лениво — во время обычной работы он не запрашивается.
+    dump, dump_tried = {}, False
+
+    def unit_for(pid):
+        """Строка для процесса: он сам, а если его нет в списке — его приложение."""
+        cur = pid
+        for _ in range(32):
+            u = units.get(cur)
+            if u is not None:
+                return u["key"]
+            if cur <= 1:
+                break
+            cur = (procs.get(cur) or {}).get("ppid", 0)
+        return None
+
+    for si in all_streams:
+        props = si.get("properties") or {}
+        if str(props.get(PHANTOM_MARK)).lower() in ("true", "1"):
+            continue                      # наш собственный беззвучный поток
+        cprops = client_props.get(si.get("client")) or {}
+        raw = str(props.get("application.process.id") or cprops.get("application.process.id") or "")
+        pid = int(raw) if raw.isdigit() else 0
+
+        # 1) поток держит известный процесс — или его приложение (если звук
+        #    играет дочерний процесс-плеер, строка всё равно про приложение)
+        key = unit_for(pid) if pid else None
+        # 2) узнаём приложение по подписи потока/клиента
+        if key is None:
+            for k in IDENT_KEYS:
+                val = props.get(k) or cprops.get(k)
+                if val:
+                    key = unique_name(str(val))
+                    if key:
+                        break
+        # 3) клиент аудиосервера уже привязан к строке
+        if key is None:
+            key = key_by_client.get(si.get("client"))
+        # 4) «PipeWire ALSA [python3.14]» — поток мимо PipeWire-клиента:
+        #    узнаём приложение по бинарнику (python3.14 — это Anki)
+        if key is None:
+            alsa = ALSA_NAME_RE.match(str(props.get("application.name") or ""))
+            cand = alsa.group(1) if alsa else (props.get("application.process.binary") or "")
+            if cand:
+                key = unique_binary(cand)
+        if key is None and not dump_tried:
+            # Ни имени, ни процесса: уведомления quickshell, «Playback Stream».
+            # Спрашиваем у PipeWire владельца потока (client.id → его свойства).
+            dump, dump_tried = dump_streams(), True
+        if key is None:
+            hint = dump.get(str(si.get("index"))) or {}
+            hint_pid = int(hint.get("pid") or 0)
+            if hint_pid:
+                pid = hint_pid
+                key = unit_for(pid)
+            if key is None and hint.get("name"):
+                key = unique_name(str(hint["name"]))
+            if key is None and hint.get("binary"):
+                key = unique_binary(str(hint["binary"]))
+            if key is None and hint.get("name"):
+                # владелец известен, но строки для него ещё нет: заводим её.
+                # Если такая подпись уже есть — не плодим вторую.
+                label = str(hint["name"])
+                key = next((k for k, g2 in groups.items()
+                            if g2["label"] == label and not g2["parent"]), None)
+                if key is None:
+                    binary = hint.get("binary") or ""
+                    chain = real_chain(pid)
+                    parent = label_of(chain[-1]) if chain else ""
+                    if parent == label:
+                        parent = ""
+                    key = "%s/%s" % (parent, label) if parent else label
+                    groups.setdefault(key, {
+                        "key": key, "label": label, "parent": parent,
+                        "depth": 1 if parent else 0,
+                        "pids": {pid} if pid else set(), "names": {label},
+                        "binaries": {binary} if binary else set(),
+                        "icons": [], "clients": set(), "streams": [],
+                        "ident_client": {}, "ident_stream": {},
+                    })
+        if key is None:
+            # совсем незнакомый поток — отдельная строка по бинарнику/имени файла
+            binary = props.get("application.process.binary") or ""
+            media = props.get("media.name") or ""
+            if not (binary or media):
+                continue
+            fill = binary or os.path.basename(media)
+            label = PRETTY_BINARY.get(fill.lower()) or fill
+            key = next((k for k, g2 in groups.items()
+                        if g2["label"] == label and not g2["parent"]), None)
+            if key is None:
+                key = label if label not in groups else "%s (поток)" % label
+            g = groups.setdefault(key, {
+                "key": key, "label": label, "parent": "", "depth": 0,
+                "pids": set(), "names": set(), "binaries": set(),
+                "icons": [], "clients": set(), "streams": [],
+                "ident_client": {}, "ident_stream": {},
+            })
+            if binary:
+                g["binaries"].add(binary)
+            g["ident_stream"].setdefault("application.name", set()).add(label)
+
+        g = groups.get(key)
+        if g is None:
+            continue
+        g["streams"].append(si)
+        ident_add(g["ident_stream"], props)
+
+    # ── 4b) что играет: заголовки MPRIS-плееров по строкам ───────────────────
+    mpris_for = {}
+    for pl in mpris_players():
+        key = unit_for(pl["pid"])
+        if key is None:
+            try:
+                comm = Path("/proc/%d/comm" % pl["pid"]).read_text().strip()
+            except OSError:
+                comm = ""
+            key = unique_binary(comm) if comm else None
+        if key is not None:
+            mpris_for.setdefault(key, []).append(pl)
+
+    # ── 5) собираем строки ──────────────────────────────────────────────────
+    rows = []
+    for key, g in groups.items():
+        names = sorted(g["names"])
+        binaries = sorted(g["binaries"])
+        streams = g["streams"]
+
+        # Иконка: сначала та, что даёт само приложение в потоке, потом — из
+        # установленного .desktop-файла (как в меню приложений), потом таблица
+        # соответствий. Всё это проверяем на существование: имя темы или путь.
+        desk = desktop_lookup(*(binaries + names + [g["label"]]))
+        icon = g["icons"][0] if g["icons"] else ""
+        if not icon and desk:
+            icon = desk["icon"]
+        if not icon:
+            for cand in [b.lower() for b in binaries] + [n.lower() for n in names]:
+                if cand in ICON_BY_BINARY:
+                    icon = ICON_BY_BINARY[cand]
+                    break
+        icon = resolve_icon(icon)
+        # имя приложения тоже берём человеческое («sotavpn» → «Sota Connect»),
+        # но только у корневой строки, только если подпись — это бинарник и
+        # только если он ещё не стал «красивым» (mpv так и остаётся «mpv»)
+        if (desk and g["depth"] == 0 and " " not in g["label"]
+                and g["label"].lower() not in PRETTY_BINARY
+                and g["label"].lower() in [str(b).lower() for b in binaries]):
+            g["label"] = desk["name"]
+
+        # «паспорт» для памяти WirePlumber и беззвучных потоков. Берём только те
+        # свойства, которые ставит само приложение, и только если они не общие
+        # для нескольких приложений (иначе заденем соседа).
+        ident = store["ident"].get(key) or {}
+        if not ident:
+            for bucket in (g["ident_client"], g["ident_stream"]):
+                for k in IDENT_KEYS:
+                    vals = [v for v in (bucket.get(k) or set()) if name_count.get(v, 0) == 1]
+                    if len(vals) == 1:
+                        ident[k] = vals[0]
+                if ident:
+                    break
+        if not ident and not g["ident_client"] and not g["ident_stream"]:
+            # приложение ещё ни разу не показывалось в аудиосервере: угадываем
+            # «паспорт» по бинарнику и памяти WirePlumber (так находится mpv)
+            for cand in [str(b) for b in binaries] + [g["label"]]:
+                for k in IDENT_KEYS:
+                    if "%s:%s" % (k, cand) in wp:
+                        ident = {k: cand}
+                        break
+                if ident:
+                    break
+        if not ident and binaries:
+            ident = {"application.name": str(binaries[0])}
+
+        own = [n for n in names if name_count.get(n, 0) == 1]
+
+        if streams:
+            volume, mute = stream_volume(streams[0]), bool(streams[0].get("mute"))
+        else:
+            # покоящееся приложение: сначала память WirePlumber (её же видят
+            # pavucontrol/wpctl), потом своя, потом 100 %
+            pct = wp_lookup(wp, ident) if ident else None
+            if pct is None:
+                pct = store["volumes"].get(key)
+            volume = 100 if pct is None else int(pct)
+            mute = volume == 0
+
+        # что сейчас играет: заголовок плеера (вкладка браузера, трек) либо имя
+        # потока (файл mpv); подпись из них собирается в самом конце
+        title = ""
+        for si in streams:
+            if si.get("corked"):
+                continue
+            nm = clean_media_name(str((si.get("properties") or {}).get("media.name") or ""),
+                                  g["label"], binaries)
+            if nm:
+                title = nm
+                break
+        for pl in mpris_for.get(key) or []:
+            if pl["status"] == "Playing" and pl["title"]:
+                title = pl["title"]
+                break
+
+        system = (bool(binaries) and all(str(b).lower() in SYSTEM_BINARIES for b in binaries)) \
+            or (bool(names) and all(n.lower() in SYSTEM_NAMES for n in names))
+
+        rows.append({
+            "key": key, "label": g["label"], "sub": "", "title": title, "icon": icon or "",
+            "parent": g["parent"], "parent_key": None, "depth": g["depth"],
+            "names": names, "own_names": own, "ident": ident,
+            "binaries": binaries, "streams": streams, "targets": streams,
+            "clients": sorted(g["clients"]), "phantoms": [ident] if ident else [],
+            "children": [], "live": streams_active(streams),
+            "volume": volume, "mute": mute,
+            "pids": sorted(p for p in g["pids"] if isinstance(p, int)),
+            "system": system,
+        })
+
+    # родитель — корневая строка, к которой относимся (и её «служебность»)
+    roots = {}
+    for r in rows:
+        if not r["parent"]:
+            roots.setdefault(r["label"], r)
+    for r in rows:
+        parent = roots.get(r["parent"]) if r["parent"] else None
+        if parent is not None:
+            r["parent_key"] = parent["key"]
+            if parent["system"]:
+                r["system"] = True
+
+    for r in rows:
+        r["children"] = [c for c in rows if c["parent_key"] == r["key"]]
+    for r in rows:
+        # Корневая строка — это всё приложение: её ползунок двигает и свой
+        # поток, и вложенные источники (Anki → mpv). Вложенная строка двигает
+        # только свой поток, поэтому два mpv у разных приложений независимы.
+        own = r["streams"]
+        kids = r["children"]
+        r["targets"] = own + [s for c in kids for s in c["streams"]]
+        phantoms = []
+        for app in [r] + kids:
+            if app["ident"] and app["ident"] not in phantoms:
+                phantoms.append(app["ident"])
+        r["phantoms"] = phantoms
+        if own:
+            r["volume"] = stream_volume(own[0])
+            r["mute"] = bool(own[0].get("mute"))
+        elif r["targets"]:
+            r["volume"] = stream_volume(r["targets"][0])
+            r["mute"] = bool(r["targets"][0].get("mute"))
+        r["live"] = streams_active(r["targets"])
+
+    for r in rows:
+        r["sub"] = state_text(r)
+
+    rows.sort(key=lambda r: (r["system"],
+                             (r["parent"] or r["label"]).lower(),
+                             r["depth"], r["label"].lower()))
+
+    # запоминаем бинарники и «паспорта»: по ним молчащие приложения снова узнаём.
+    # «Родители-обёртки» без собственного звука в каталог не попадают — иначе в
+    # списке навсегда заводились бы случайные промежуточные процессы.
+    changed = False
+    for r in rows:
+        known = store.setdefault("known", {})
+        sounds = bool(r["streams"] or r["clients"])
+        bins = [b for b in r["binaries"] if b]
+        if sounds and bins and known.get(r["key"]) != bins:
+            known[r["key"]] = bins
+            changed = True
+        if sounds and r["ident"] and store["ident"].get(r["key"]) != r["ident"]:
+            store["ident"][r["key"]] = r["ident"]
+            changed = True
+    if changed:
+        save_store(store)
+    return rows
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Применение изменений
+# ─────────────────────────────────────────────────────────────────────────────
+
+def remember(row, pct):
+    """Запомнить громкость строки и «паспорт» приложения в своём файле."""
+    store = load_store()
+    store["volumes"][row["key"]] = pct
+    if row.get("ident"):
+        store["ident"][row["key"]] = row["ident"]
+    save_store(store)
+    return store
+
+
+def _apply_one(row, pct):
+    """Громкость одной строке: её потокам — сразу, молчащей — беззвучным потоком."""
+    own = row.get("streams") or []
+    if own:
+        for si in own:
+            run(["pactl", "set-sink-input-volume", str(si["index"]), "%d%%" % pct])
+    elif row.get("ident"):
+        phantom(row["ident"], pct)
+    remember(row, pct)
+
+
+def set_volume(row, pct):
+    """Громкость строки.
+
+    У приложения с вложенными источниками (Anki → mpv) ползунок родителя
+    двигает всех на ту же разницу: Anki −5 % → и у mpv −5 %. Ползунок
+    вложенной строки двигает только её саму.
+    """
+    kids = row.get("children") or []
+    delta = pct - int(row.get("volume") or 0)
+    _apply_one(row, pct)
+    if not delta:
+        return
+    for kid in kids:
+        _apply_one(kid, max(0, int(kid.get("volume") or 0) + delta))
+
+
+def set_mute(row, muted):
+    targets = row.get("targets") or []
+    if targets:
+        for si in targets:
+            run(["pactl", "set-sink-input-mute", str(si["index"]), "1" if muted else "0"])
+        remember(row, row["volume"])
+        return
+    # WirePlumber не сохраняет флаг mute из свойств потока, поэтому «мьют»
+    # молчащего приложения = запомненная громкость 0; прежнюю храним сами.
+    store = load_store()
+    key = row["key"]
+    idents = row.get("phantoms") or ([row["ident"]] if row.get("ident") else [])
+    if muted:
+        prev = row["volume"] or 100
+        if prev:
+            store["prev"][key] = prev
+        for ident in idents:
+            phantom(ident, 0)
+        store["volumes"][key] = 0
+    else:
+        back = store["prev"].pop(key, 100) or 100
+        for ident in idents:
+            phantom(ident, back)
+        store["volumes"][key] = back
+    if row.get("ident"):
+        store["ident"][key] = row["ident"]
+    save_store(store)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Строка списка
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Иконки одного размера и бегущая строка
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ICON_CACHE = {}
+
+
+def _icon_path(icon):
+    if icon.startswith("/"):
+        return icon if os.path.exists(icon) else ""
+    try:
+        theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+        paintable = theme.lookup_icon(icon, None, 128, 1, Gtk.TextDirection.NONE, 0)
+        f = paintable.get_file()
+        return f.get_path() if f else ""
+    except Exception:
+        return ""
+
+
+def normalized_icon(icon, box):
+    """Иконка, обрезанная по видимому содержимому и вписанная в квадрат box×box.
+
+    У иконок разные поля и пропорции: одни рисуют знак на весь холст, другие
+    оставляют вокруг пустоту. Обрезаем прозрачные поля и вписываем в одинаковый
+    квадрат — тогда все иконки выглядят одного размера и стоят ровно по центру.
+    Возвращает Gdk.Texture (в двойном разрешении) либо None.
+    """
+    key = (icon, box)
+    if key in _ICON_CACHE:
+        return _ICON_CACHE[key]
+    tex = None
+    try:
+        path = _icon_path(icon)
+        if path:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_size(path, 256, 256)
+            if not pb.get_has_alpha():
+                pb = pb.add_alpha(False, 0, 0, 0)
+            w, h, rs = pb.get_width(), pb.get_height(), pb.get_rowstride()
+            px = pb.get_pixels()
+            top, bottom, left, right = h, -1, w, -1
+            for y in range(h):
+                row = px[y * rs + 3: y * rs + w * 4: 4]
+                xs = [x for x, a in enumerate(row) if a > 40]
+                if xs:
+                    top, bottom = min(top, y), y
+                    left, right = min(left, xs[0]), max(right, xs[-1])
+            if bottom >= 0:
+                pb = pb.new_subpixbuf(left, top, right - left + 1, bottom - top + 1)
+            side = box * 2
+            cw, ch = pb.get_width(), pb.get_height()
+            k = min(side / cw, side / ch)
+            nw, nh = max(1, round(cw * k)), max(1, round(ch * k))
+            pb = pb.scale_simple(nw, nh, GdkPixbuf.InterpType.HYPER)
+            canvas = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, side, side)
+            canvas.fill(0)
+            pb.copy_area(0, 0, nw, nh, canvas, (side - nw) // 2, (side - nh) // 2)
+            tex = Gdk.Texture.new_for_pixbuf(canvas)
+    except Exception:
+        tex = None
+    _ICON_CACHE[key] = tex
+    return tex
+
+
+class Marquee(Gtk.ScrolledWindow):
+    """Одна строка текста; если не помещается — прокручивается, как на старых плеерах."""
+
+    SPEED = 34.0      # пикселей в секунду
+    PAUSE = 1.6       # пауза в начале и в конце, секунды
+
+    def __init__(self, css_class, width):
+        super().__init__()
+        self.set_policy(Gtk.PolicyType.EXTERNAL, Gtk.PolicyType.NEVER)
+        self.set_can_target(False)              # колесо мыши идёт дальше — в список
+        self.set_propagate_natural_height(True)
+        self.set_propagate_natural_width(False)
+        self.set_size_request(width, -1)
+        self.set_hexpand(False)
+        self.label = Gtk.Label(xalign=0)
+        self.label.add_css_class(css_class)
+        self.set_child(self.label)
+        self._t0 = None
+        self._text = None
+        self.add_tick_callback(self._tick)
+
+    def set_text(self, text):
+        if text != self._text:
+            self._text = text
+            self.label.set_text(text)
+            self._t0 = None
+            self.get_hadjustment().set_value(0)
+
+    def _tick(self, widget, clock):
+        adj = self.get_hadjustment()
+        span = adj.get_upper() - adj.get_page_size()
+        if span <= 1 or not self.get_mapped():
+            if adj.get_value():
+                adj.set_value(0)
+            self._t0 = None
+            return True
+        now = clock.get_frame_time() / 1_000_000
+        if self._t0 is None:
+            self._t0 = now
+        run = span / self.SPEED
+        cycle = 2 * (self.PAUSE + run)
+        t = (now - self._t0) % cycle
+        if t < self.PAUSE:
+            pos = 0.0
+        elif t < self.PAUSE + run:
+            pos = (t - self.PAUSE) * self.SPEED
+        elif t < 2 * self.PAUSE + run:
+            pos = span
+        else:
+            pos = span - (t - 2 * self.PAUSE - run) * self.SPEED
+        adj.set_value(max(0.0, min(span, pos)))
+        return True
+
+
+class AppRow(Gtk.ListBoxRow):
+    def __init__(self, window, app):
+        super().__init__()
+        self.window = window
+        self.app = app
+        self.suppress = False
+        self.last_user_change = 0.0
+        self.pending_volume = None
+        self.tile_key = None
+        self.acc_label = ""
+
+        self.add_css_class("mixer-row")
+
+        # Вложенные источники (Anki → mpv) рисуем с «веткой» дерева: ствол идёт
+        # от приложения вниз, к каждому источнику — отвод. Приложение и его
+        # источники склеены в одну карточку (классы g-head / g-mid / g-tail).
+        child = bool(app.get("depth"))
+        tile_size, texts_width = (26, 160) if child else (34, 190)
+        if child:
+            self.add_css_class("child")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        for setter, val in (("set_margin_top", 8 if not child else 6),
+                            ("set_margin_bottom", 8 if not child else 6),
+                            ("set_margin_start", 12), ("set_margin_end", 12)):
+            getattr(box, setter)(val)
+
+        self.tree_bottom = None
+        self.stub = None
+        if child:
+            # ствол вынесен за поля содержимого и тянется на всю высоту строки,
+            # поэтому линия между строками не рвётся
+            trunk = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            trunk.set_margin_start(28)
+            top = Gtk.Box()
+            top.add_css_class("tree-top")
+            top.set_vexpand(True)
+            self.tree_bottom = Gtk.Box()
+            self.tree_bottom.add_css_class("tree-bottom")
+            self.tree_bottom.set_vexpand(True)
+            trunk.append(top)
+            trunk.append(self.tree_bottom)
+            trunk.set_homogeneous(True)
+            self.trunk = trunk
+            box.set_margin_start(0)
+
+        # 1) плитка: иконка приложения либо первая буква названия на цветном фоне
+        self.tile = Gtk.Box()
+        self.tile.add_css_class("mixer-tile")
+        self.tile.set_size_request(tile_size, tile_size)
+        self.tile.set_valign(Gtk.Align.CENTER)
+        self.tile_image = Gtk.Image()
+        self.tile_image.set_pixel_size(22 if not child else 17)
+        self.tile_letter = Gtk.Label()
+        self.tile_letter.add_css_class("mixer-tile-letter")
+        self.tile_letter.set_visible(False)
+        self.tile.set_hexpand(False)      # ширину плитки задаёт только размер
+        self.tile.set_halign(Gtk.Align.START)
+        for w in (self.tile_image, self.tile_letter):
+            w.set_hexpand(True)
+            w.set_halign(Gtk.Align.CENTER)
+            w.set_valign(Gtk.Align.CENTER)
+        self.tile.append(self.tile_image)
+        self.tile.append(self.tile_letter)
+        box.append(self.tile)
+
+        # 2) название + подпись — фиксированная колонка (как label/sub в rank-bars)
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        texts.set_size_request(texts_width, -1)
+        texts.set_valign(Gtk.Align.CENTER)
+        self.label = Gtk.Label(xalign=0)
+        self.label.add_css_class("mixer-name")
+        self.label.set_ellipsize(3)
+        self.dot = Gtk.Box()
+        self.dot.add_css_class("live-dot")
+        self.dot.set_valign(Gtk.Align.CENTER)
+        self.dot.set_visible(False)
+        name_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        name_row.append(self.label)
+        name_row.append(self.dot)
+        # длинное название (вкладка браузера) не раздвигает колонку, а бежит строкой
+        self.sub = Marquee("mixer-sub", texts_width)
+        self.label.set_width_chars(6)
+        self.label.set_max_width_chars(22)
+        texts.append(name_row)
+        texts.append(self.sub)
+        box.append(texts)
+
+        # 3) слайдер — растягивается на всё свободное место (стиль HeroUI).
+        # Шкала 0…MAX_VOLUME: «потолка» нет, громкость можно тянуть выше 100 %.
+        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, MAX_VOLUME, 1)
+        self.scale.add_css_class("mixer")
+        self.scale.set_draw_value(False)
+        self.scale.set_hexpand(True)
+        self.scale.set_valign(Gtk.Align.CENTER)
+        self.scale.add_mark(100, Gtk.PositionType.BOTTOM, None)   # где «нормальные» 100%
+        self.scale.connect("value-changed", self.on_scale)
+        wheel = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        wheel.connect("scroll", self.on_wheel)
+        self.scale.add_controller(wheel)
+        box.append(self.scale)
+
+        # 4) мьют — круглая кнопка-иконка
+        self.mute_btn = Gtk.ToggleButton()
+        self.mute_btn.add_css_class("mixer-mute")
+        self.mute_btn.set_valign(Gtk.Align.CENTER)
+        self.mute_btn.connect("toggled", self.on_mute)
+        box.append(self.mute_btn)
+
+        # 5) значение справа — бейдж-«пилюля»
+        self.pct = Gtk.Label(xalign=0.5)
+        self.pct.add_css_class("mixer-value")
+        self.pct.set_valign(Gtk.Align.CENTER)
+        box.append(self.pct)
+
+        if child:
+            outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+            outer.append(self.trunk)
+            box.set_hexpand(True)
+            outer.append(box)
+            self.set_child(outer)
+        else:
+            # заглушка ствола под плиткой приложения: соединяет её с источниками
+            overlay = Gtk.Overlay()
+            overlay.set_child(box)
+            self.stub = Gtk.Box()
+            self.stub.add_css_class("tree-stub")
+            self.stub.set_halign(Gtk.Align.START)
+            self.stub.set_valign(Gtk.Align.END)
+            self.stub.set_margin_start(28)
+            self.stub.set_visible(False)
+            overlay.add_overlay(self.stub)
+            self.set_child(overlay)
+        self.update(app)
+
+    def _set_class(self, name, on):
+        if on:
+            self.add_css_class(name)
+        else:
+            self.remove_css_class(name)
+
+    def _set_tile(self, app):
+        """Плитка приложения: настоящая иконка или буква на цветном фоне."""
+        icon = app["icon"] or ""
+        is_file = icon.startswith("/")
+        has_icon = bool(icon) and (is_file or theme_icon_exists(icon))
+        letter = next((c for c in app["label"] if c.isalnum()), "?").upper()
+        key = ("icon", icon) if has_icon else ("letter", letter)
+        if key == self.tile_key:
+            return
+        self.tile_key = key
+
+        for i in range(TILE_COUNT):
+            self.tile.remove_css_class("tile-%d" % i)
+        self.tile.remove_css_class("has-icon")
+        self.tile.set_tooltip_text(app["label"])
+
+        if has_icon:
+            box = 28 if not app.get("depth") else 20
+            tex = normalized_icon(icon, box)
+            try:
+                if tex is not None:
+                    self.tile_image.set_from_paintable(tex)
+                elif is_file:
+                    self.tile_image.set_from_file(icon)
+                else:
+                    self.tile_image.set_from_icon_name(icon)
+                self.tile_image.set_pixel_size(box)
+            except Exception:
+                has_icon = False
+
+        if not has_icon:
+            color = zlib.crc32(app["key"].encode()) % TILE_COUNT
+            self.tile.add_css_class("tile-%d" % color)
+            self.tile_letter.set_text(letter)
+
+        if has_icon:
+            self.tile.add_css_class("has-icon")      # настоящая иконка — без подложки
+        self.tile_image.set_visible(has_icon)
+        self.tile_letter.set_visible(not has_icon)
+
+    def update(self, app):
+        self.app = app
+        self.label.set_text(app["label"])
+        self.sub.set_text(app["sub"])
+        self.sub.get_parent().set_tooltip_text(app["sub"])
+        self._set_tile(app)
+
+        tip = tr("ключ аудиосервера: %s") % ", ".join(app["names"])
+        if not app["live"]:
+            tip += "\n" + tr("приложение сейчас молчит — громкость применится, когда зазвучит")
+        self.dot.set_tooltip_text(tr("звучит сейчас"))
+        self.scale.set_tooltip_text(tip)
+
+        # играющие приложения подсвечиваются акцентом
+        self._set_class("live", bool(app["live"]))
+        self.dot.set_visible(bool(app["live"]))
+
+        # доступное имя ползунка для скринридера
+        acc = tr("Громкость: %s") % app["label"]
+        if acc != self.acc_label:
+            self.acc_label = acc
+            try:
+                self.scale.update_property([Gtk.AccessibleProperty.LABEL], [acc])
+            except Exception:
+                pass
+
+        busy = (time.monotonic() - self.last_user_change) < 2.0
+        self.suppress = True
+        try:
+            if not busy:
+                self._ensure_range(app["volume"])
+                self.scale.set_value(app["volume"])
+            vol = int(self.scale.get_value())
+            self.pct.set_text("%d%%" % vol)
+            muted = bool(app["mute"]) or vol == 0
+            self.mute_btn.set_active(muted)
+            self.mute_btn.set_icon_name(MUTE_ICON if muted else LIVE_ICON)
+            self.mute_btn.set_tooltip_text(tr("Включить звук") if muted else tr("Заглушить"))
+            try:
+                self.mute_btn.update_property(
+                    [Gtk.AccessibleProperty.LABEL],
+                    [tr("Заглушить: %s") % app["label"] if not muted
+                     else tr("Включить звук: %s") % app["label"]])
+            except Exception:
+                pass
+            self._style_volume(vol, muted)
+        finally:
+            self.suppress = False
+
+    def _style_volume(self, vol, muted):
+        """Цвет по смыслу: красный — мьют, янтарный — громче 100 %, иначе акцент."""
+        boost = vol > 100 and not muted
+        for widget in (self, self.scale):
+            for name, on in (("muted", muted), ("boost", boost)):
+                if on:
+                    widget.add_css_class(name)
+                else:
+                    widget.remove_css_class(name)
+
+    def set_group(self, role, last_child=False):
+        """Положение строки в карточке: solo / head (с источниками) / mid / tail."""
+        for r in ("solo", "head", "mid", "tail"):
+            self._set_class("g-" + r, r == role)
+        if self.stub is not None:
+            self.stub.set_visible(role == "head")
+        if self.tree_bottom is not None:
+            # у последнего источника линия вниз не нужна — под ним ничего нет
+            if last_child:
+                self.tree_bottom.add_css_class("last")
+            else:
+                self.tree_bottom.remove_css_class("last")
+
+    def _ensure_range(self, vol):
+        """Ползунок должен вмещать текущую громкость — даже если она выше 300 %."""
+        adj = self.scale.get_adjustment()
+        if vol > adj.get_upper():
+            adj.set_upper(vol + 25)
+
+    def on_wheel(self, controller, dx, dy):
+        """Колесо мыши над ползунком — громкость (обычно VOLUME_STEP, с Ctrl — x10).
+
+        Над остальной строкой колесо не перехватываем: там оно листает список.
+        """
+        if self.suppress or not dy:
+            return False
+        state = controller.get_current_event_state()
+        step = 10 if state & Gdk.ModifierType.CONTROL_MASK else VOLUME_STEP
+        tick = int(dy) if abs(dy) >= 1 else (1 if dy > 0 else -1)
+        vol = max(0, int(self.scale.get_value()) - tick * step)
+        self._ensure_range(vol)
+        self.last_user_change = time.monotonic()
+        self.scale.set_value(vol)
+        return True
+
+    def on_scale(self, scale):
+        if self.suppress:
+            return
+        self.last_user_change = time.monotonic()
+        vol = int(scale.get_value())
+        self.pct.set_text("%d%%" % vol)
+        muted = vol == 0
+        self.mute_btn.set_icon_name(MUTE_ICON if muted else LIVE_ICON)
+        self._style_volume(vol, muted)
+        self.window.schedule_volume(self, vol)
+
+    def on_mute(self, btn):
+        if self.suppress:
+            return
+        self.last_user_change = time.monotonic()
+        self.window.apply_mute(self, btn.get_active())
+
+
+class MasterRow(Gtk.Box):
+    """Общая громкость текущего аудиовыхода — карточка в самом верху окна."""
+
+    MASTER_MAX = 150
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.add_css_class("master-card")
+        self.suppress = False
+        self.last_user_change = 0.0
+        self.pending = 0
+        for setter in ("set_margin_top", "set_margin_bottom"):
+            getattr(self, setter)(0)
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        inner.set_hexpand(True)
+        for setter, val in (("set_margin_top", 10), ("set_margin_bottom", 10),
+                            ("set_margin_start", 12), ("set_margin_end", 12)):
+            getattr(inner, setter)(val)
+
+        icon = Gtk.Image.new_from_icon_name("audio-speakers-symbolic")
+        icon.set_pixel_size(22)
+        icon.add_css_class("master-icon")
+        icon.set_size_request(34, 34)
+        inner.append(icon)
+
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        texts.set_size_request(190, -1)
+        texts.set_valign(Gtk.Align.CENTER)
+        self.title = Gtk.Label(label=tr("Общая громкость"), xalign=0)
+        self.title.add_css_class("mixer-name")
+        title = self.title
+        self.on_changed = None                 # окно подставит refresh
+        self.out_label = Gtk.Label(xalign=0)
+        self.out_label.add_css_class("mixer-sub")
+        self.out_label.set_ellipsize(3)
+        self.out_label.set_max_width_chars(24)
+        out_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        out_box.append(self.out_label)
+        out_box.append(Gtk.Image.new_from_icon_name("pan-down-symbolic"))
+        self.out_button = Gtk.MenuButton()
+        self.out_button.set_child(out_box)
+        self.out_button.set_has_frame(False)
+        self.out_button.set_halign(Gtk.Align.START)
+        inner_btn = self.out_button.get_first_child()
+        if inner_btn is not None:
+            inner_btn.add_css_class("output-button")
+        self.out_pop = Gtk.Popover()
+        self.out_pop.set_child(Gtk.Box())
+        self.out_pop.connect("show", self.rebuild_outputs)
+        hk = Gtk.EventControllerKey()
+        hk.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        hk.connect("key-pressed", self.on_hotkey_key)
+        self.out_pop.add_controller(hk)
+        self.recording = False
+        self.out_button.set_popover(self.out_pop)
+        self.out_button.set_tooltip_text(tr("Устройство вывода"))
+        texts.append(title)
+        texts.append(self.out_button)
+        inner.append(texts)
+
+        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, self.MASTER_MAX, 1)
+        self.scale.add_css_class("mixer")
+        self.scale.set_draw_value(False)
+        self.scale.set_hexpand(True)
+        self.scale.set_valign(Gtk.Align.CENTER)
+        self.scale.add_mark(100, Gtk.PositionType.BOTTOM, None)
+        self.scale.connect("value-changed", self.on_scale)
+        wheel = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+        wheel.connect("scroll", self.on_wheel)
+        self.scale.add_controller(wheel)
+        try:
+            self.scale.update_property([Gtk.AccessibleProperty.LABEL], [tr("Общая громкость")])
+        except Exception:
+            pass
+        inner.append(self.scale)
+
+        self.mute_btn = Gtk.ToggleButton()
+        self.mute_btn.add_css_class("mixer-mute")
+        self.mute_btn.set_valign(Gtk.Align.CENTER)
+        self.mute_btn.connect("toggled", self.on_mute)
+        inner.append(self.mute_btn)
+
+        self.pct = Gtk.Label(xalign=0.5)
+        self.pct.add_css_class("mixer-value")
+        self.pct.set_valign(Gtk.Align.CENTER)
+        inner.append(self.pct)
+        self.append(inner)
+
+    # ── меню выбора выхода ──────────────────────────────────────────────────
+
+    def _changed(self):
+        if self.on_changed:
+            self.on_changed()
+
+    def rebuild_outputs(self, *_):
+        """Перестраивает содержимое меню: выходы, скрытые, хоткей и команда."""
+        self.recording = False
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        for setter in ("set_margin_top", "set_margin_bottom", "set_margin_start", "set_margin_end"):
+            getattr(box, setter)(10)
+        box.set_size_request(330, -1)
+
+        head = Gtk.Label(label=tr("Устройство вывода").upper(), xalign=0)
+        head.add_css_class("mixer-section")
+        head.set_margin_bottom(4)
+        box.append(head)
+
+        outs = list_outputs()
+        shown = [o for o in outs if not o["hidden"]]
+        hidden = [o for o in outs if o["hidden"]]
+        group = None
+        for o in shown:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            cb = Gtk.CheckButton(label=o["label"])
+            cb.set_hexpand(True)
+            cb.set_active(o["default"])
+            if group is None:
+                group = cb
+            else:
+                cb.set_group(group)
+            cb.connect("toggled", self._on_pick, o["name"])
+            row.append(cb)
+            if o["dead"]:
+                badge = Gtk.Label(label=tr("недоступен"))
+                badge.add_css_class("mixer-sub")
+                row.append(badge)
+            hide = Gtk.Button.new_from_icon_name("view-conceal-symbolic")
+            hide.add_css_class("flat")
+            hide.add_css_class("output-action")
+            hide.set_tooltip_text(tr("Скрыть выход"))
+            hide.connect("clicked", self._on_hide, o["name"], True)
+            row.append(hide)
+            box.append(row)
+
+        dead = [o for o in shown if o["dead"] and not o["default"]]
+        if dead:
+            btn = Gtk.Button(label=tr("Скрыть недоступные (%d)") % len(dead))
+            btn.add_css_class("flat")
+            btn.set_halign(Gtk.Align.START)
+            btn.connect("clicked", self._on_hide_dead)
+            box.append(btn)
+
+        if hidden:
+            exp = Gtk.Expander(label=tr("Скрытые: %d") % len(hidden))
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            for o in hidden:
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                lbl = Gtk.Label(label=o["label"], xalign=0)
+                lbl.add_css_class("mixer-sub")
+                lbl.set_hexpand(True)
+                lbl.set_ellipsize(3)
+                lbl.set_max_width_chars(34)
+                row.append(lbl)
+                show = Gtk.Button.new_from_icon_name("view-reveal-symbolic")
+                show.add_css_class("flat")
+                show.add_css_class("output-action")
+                show.set_tooltip_text(tr("Показать выход"))
+                show.connect("clicked", self._on_hide, o["name"], False)
+                row.append(show)
+                inner.append(row)
+            exp.set_child(inner)
+            exp.set_margin_top(4)
+            box.append(exp)
+
+        box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        nxt = Gtk.Button(label=tr("Переключить на следующий"))
+        nxt.connect("clicked", self._on_next)
+        box.append(nxt)
+
+        # хоткей: запись сочетания и команда для привязки в системе
+        hk_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        hk_row.set_margin_top(6)
+        hk_lbl = Gtk.Label(label=tr("Горячая клавиша"), xalign=0)
+        hk_lbl.set_hexpand(True)
+        hk_row.append(hk_lbl)
+        self.hk_btn = Gtk.Button()
+        self.hk_btn.connect("clicked", self._on_hotkey_record)
+        hk_row.append(self.hk_btn)
+        clear = Gtk.Button.new_from_icon_name("edit-clear-symbolic")
+        clear.add_css_class("flat")
+        clear.set_tooltip_text(tr("Сбросить"))
+        clear.connect("clicked", self._on_hotkey_clear)
+        hk_row.append(clear)
+        box.append(hk_row)
+        self._refresh_hotkey_label()
+
+        note = Gtk.Label(label=tr("Переключение работает только пока программа запущена. "
+                                  "Рекомендуем добавить её в автозапуск."),
+                         xalign=0, wrap=True)
+        note.add_css_class("mixer-sub")
+        note.set_max_width_chars(44)
+        note.set_margin_top(4)
+        box.append(note)
+        self.out_pop.set_child(box)
+
+    def _refresh_hotkey_label(self):
+        if self.recording:
+            self.hk_btn.set_label(tr("нажмите сочетание… (Esc — отмена)"))
+            return
+        accel = load_outputs_cfg()["hotkey"]
+        self.hk_btn.set_label(Gtk.accelerator_get_label(*Gtk.accelerator_parse(accel)[1:])
+                              if accel and Gtk.accelerator_parse(accel)[0] else tr("не задана"))
+
+    def _on_pick(self, cb, name):
+        if cb.get_active():
+            switch_output(name)
+            self._changed()
+
+    def _on_hide(self, _btn, name, hide):
+        set_hidden(name, hide)
+        self.rebuild_outputs()
+        self._changed()
+
+    def _on_hide_dead(self, _btn):
+        hide_dead_outputs()
+        self.rebuild_outputs()
+        self._changed()
+
+    def _on_next(self, _btn):
+        next_output()
+        self.rebuild_outputs()
+        self._changed()
+
+    def _on_hotkey_record(self, _btn):
+        self.recording = True
+        self._refresh_hotkey_label()
+        self.out_pop.grab_focus()
+
+    def _on_hotkey_clear(self, _btn):
+        cfg = load_outputs_cfg()
+        cfg["hotkey"] = ""
+        save_outputs_cfg(cfg)
+        self.rebuild_outputs()
+
+    def on_hotkey_key(self, ctrl, keyval, keycode, state):
+        """Запись сочетания: ловим первую «настоящую» клавишу вместе с модификаторами."""
+        if not self.recording:
+            return False
+        if keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R, Gdk.KEY_Shift_L, Gdk.KEY_Shift_R,
+                      Gdk.KEY_Alt_L, Gdk.KEY_Alt_R, Gdk.KEY_Super_L, Gdk.KEY_Super_R,
+                      Gdk.KEY_ISO_Level3_Shift, Gdk.KEY_Meta_L, Gdk.KEY_Meta_R):
+            return True                          # просто модификатор — ждём остальное
+        self.recording = False
+        if keyval != Gdk.KEY_Escape:
+            mods = state & Gtk.accelerator_get_default_mod_mask()
+            cfg = load_outputs_cfg()
+            cfg["hotkey"] = Gtk.accelerator_name(keyval, mods)
+            save_outputs_cfg(cfg)
+        self.rebuild_outputs()
+        return True
+
+    def _style(self, vol, muted):
+        for widget in (self, self.scale):
+            for name, on in (("muted", muted), ("boost", vol > 100 and not muted)):
+                if on:
+                    widget.add_css_class(name)
+                else:
+                    widget.remove_css_class(name)
+        self.mute_btn.set_icon_name(MUTE_ICON if muted else LIVE_ICON)
+        self.mute_btn.set_tooltip_text(tr("Включить звук") if muted else tr("Заглушить всю систему"))
+        try:
+            self.mute_btn.update_property([Gtk.AccessibleProperty.LABEL],
+                                          [tr("Включить звук") if muted else tr("Заглушить всю систему")])
+        except Exception:
+            pass
+
+    def update(self, info):
+        if not info:
+            self.set_visible(False)
+            return
+        self.set_visible(True)
+        self.title.set_text(tr("Общая громкость"))
+        self.out_label.set_text(info["label"])
+        self.out_button.set_tooltip_text(tr("Устройство вывода"))
+        busy = (time.monotonic() - self.last_user_change) < 2.0
+        self.suppress = True
+        try:
+            if not busy:
+                adj = self.scale.get_adjustment()
+                if info["volume"] > adj.get_upper():
+                    adj.set_upper(info["volume"] + 25)
+                self.scale.set_value(info["volume"])
+            vol = int(self.scale.get_value())
+            self.pct.set_text("%d%%" % vol)
+            muted = bool(info["mute"]) or vol == 0
+            self.mute_btn.set_active(muted)
+            self._style(vol, muted)
+        finally:
+            self.suppress = False
+
+    def _schedule(self, vol):
+        self.last_user_change = time.monotonic()
+        self.pending = vol
+        if getattr(self, "_timer", 0):
+            return
+        self._timer = GLib.timeout_add(150, self._flush)
+
+    def _flush(self):
+        self._timer = 0
+        master_set_volume(self.pending)
+        return False
+
+    def on_wheel(self, controller, dx, dy):
+        if self.suppress or not dy:
+            return False
+        state = controller.get_current_event_state()
+        step = 10 if state & Gdk.ModifierType.CONTROL_MASK else VOLUME_STEP
+        tick = int(dy) if abs(dy) >= 1 else (1 if dy > 0 else -1)
+        vol = max(0, int(self.scale.get_value()) - tick * step)
+        adj = self.scale.get_adjustment()
+        if vol > adj.get_upper():
+            adj.set_upper(vol + 25)
+        self.last_user_change = time.monotonic()
+        self.scale.set_value(vol)
+        return True
+
+    def on_scale(self, scale):
+        if self.suppress:
+            return
+        vol = int(scale.get_value())
+        self.pct.set_text("%d%%" % vol)
+        self._style(vol, vol == 0)
+        self._schedule(vol)
+
+    def on_mute(self, btn):
+        if self.suppress:
+            return
+        self.last_user_change = time.monotonic()
+        master_set_mute(btn.get_active())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Окно
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MixerWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title=APP_TITLE)
+        self.add_css_class("mixer-win")
+        self.set_default_size(880, -1)      # высоту подбирает GTK по содержимому
+        self.rows = {}
+        self.pending = {}
+        self._rows_shown = None
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        self.title_widget = Adw.WindowTitle(
+            title=APP_TITLE,
+            subtitle=tr("громкость каждого приложения отдельно"))
+        header.set_title_widget(self.title_widget)
+        self.show_system = Gtk.ToggleButton(label=tr("служебные"))
+        self.show_system.add_css_class("system-toggle")
+        self.show_system.set_valign(Gtk.Align.CENTER)
+        self.show_system.set_tooltip_text(
+            tr("Показать служебные приложения (WirePlumber, порталы и т.п.).\n"
+               "Они появятся ниже разделительной полосы."))
+        self.show_system.set_active(bool(load_ui().get("show_system")))
+        header.pack_start(self.show_system)
+        header.pack_start(self._make_lang_button())
+        header.pack_end(self._make_theme_switch())
+        toolbar.add_top_bar(header)
+        self._header = header
+        GLib.idle_add(self._center_header_buttons)
+
+        self.user_list = self._make_list()
+        self.system_list = self._make_list()
+
+        # Раздел «служебные» показывается только по кнопке и отделяется
+        # разделительной полосой, чтобы не искать всё в одной куче.
+        self.system_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        sys_head = self._section(tr("Служебные"))
+        self.sys_head = sys_head
+        sys_head.set_margin_top(18)
+        self.system_box.append(sys_head)
+        self.system_box.append(self.system_list)
+        self.system_box.set_visible(False)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        content.set_margin_top(10)
+        content.set_margin_bottom(14)
+        content.set_margin_start(12)
+        content.set_margin_end(12)
+        self.master = MasterRow()
+        self.master.on_changed = self.refresh
+        content.append(self.master)
+        self.user_head = self._section(tr("Звук приложений"))
+        content.append(self.user_head)
+        content.append(self.user_list)
+        content.append(self.system_box)
+
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        # Высоту окна считает сам GTK по содержимому списка: окно ровно по
+        # строкам (без пустого поля) и растёт/уменьшается вместе с ними. Если
+        # список станет выше экрана, окно упрётся в край и список начнёт
+        # прокручиваться колесом.
+        scroller.set_propagate_natural_height(True)
+        scroller.set_child(content)
+        toolbar.set_content(scroller)
+        self.set_content(toolbar)
+
+        # Esc — закрыть окно (привычно для всплывающих панелей).
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+
+        GLib.timeout_add(REFRESH_MS, self.refresh)
+        self.show_system.connect("toggled", self.on_system_toggled)
+        self.refresh()
+
+    def _make_theme_switch(self):
+        """Переключатель тёмная ⇄ светлая: бегунок с солнцем и луной."""
+        overlay = Gtk.Overlay()
+        self.theme_switch = Gtk.Switch()
+        self.theme_switch.add_css_class("theme-switch")
+        self.theme_switch.set_valign(Gtk.Align.CENTER)
+        dark = (load_ui().get("theme") or DEFAULT_THEME) != "light"
+        self.theme_switch.set_active(dark)
+        self.theme_switch.set_tooltip_text(tr("Тема: тёмная / светлая"))
+        try:
+            self.theme_switch.update_property([Gtk.AccessibleProperty.LABEL],
+                                              [tr("Тёмная тема")])
+        except Exception:
+            pass
+        overlay.set_child(self.theme_switch)
+        self.sun = Gtk.Image.new_from_icon_name("weather-clear-symbolic")
+        self.moon = Gtk.Image.new_from_icon_name("weather-clear-night-symbolic")
+        for icon, align in ((self.sun, Gtk.Align.START), (self.moon, Gtk.Align.END)):
+            icon.set_pixel_size(14)
+            icon.add_css_class("theme-icon")
+            icon.set_halign(align)
+            icon.set_valign(Gtk.Align.CENTER)
+            icon.set_margin_start(7)
+            icon.set_margin_end(7)
+            icon.set_can_target(False)
+            overlay.add_overlay(icon)
+        self.theme_switch.connect("notify::active", self.on_theme_toggled)
+        self._theme_icons()
+        return overlay
+
+    def _make_lang_button(self):
+        """Кнопка «язык»: выбор языка интерфейса (или «как в системе»)."""
+        self.lang_button = Gtk.MenuButton(label=tr("язык"))
+        inner = self.lang_button.get_first_child()          # сама кнопка внутри MenuButton
+        if inner is not None:
+            inner.add_css_class("system-toggle")
+        self.lang_button.set_valign(Gtk.Align.CENTER)
+        self.lang_button.set_tooltip_text(tr("Язык интерфейса"))
+
+        pop = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        for setter in ("set_margin_top", "set_margin_bottom", "set_margin_start", "set_margin_end"):
+            getattr(box, setter)(8)
+        self.lang_title = Gtk.Label(label=tr("Язык интерфейса").upper(), xalign=0)
+        self.lang_title.add_css_class("mixer-section")
+        self.lang_title.set_margin_bottom(6)
+        box.append(self.lang_title)
+
+        pref = load_ui().get("lang") or "auto"
+        group, self.lang_checks = None, {}
+        entries = [("auto", None)] + available_languages()
+        for code, name in entries:
+            cb = Gtk.CheckButton(label=tr("Как в системе") if code == "auto" else name)
+            if group is None:
+                group = cb
+            else:
+                cb.set_group(group)
+            cb.set_active(code == pref or (pref not in dict(entries) and code == "auto"))
+            cb.connect("toggled", self.on_lang_chosen, code)
+            self.lang_checks[code] = cb
+            box.append(cb)
+        pop.set_child(box)
+        self.lang_popover = pop
+        self.lang_button.set_popover(pop)
+        return self.lang_button
+
+    def on_lang_chosen(self, cb, code):
+        if not cb.get_active():
+            return
+        ui = load_ui()
+        ui["lang"] = code
+        save_ui(ui)
+        set_language(resolve_lang(code))
+        self.apply_language()
+        self.lang_popover.popdown()
+
+    def apply_language(self):
+        """Перевести всё статическое в окне; строки обновятся сами при refresh()."""
+        self.lang_button.set_label(tr("язык"))
+        self.lang_button.set_tooltip_text(tr("Язык интерфейса"))
+        self.lang_title.set_text(tr("Язык интерфейса").upper())
+        self.lang_checks["auto"].set_label(tr("Как в системе"))
+        self.show_system.set_label(tr("служебные"))
+        self.show_system.set_tooltip_text(
+            tr("Показать служебные приложения (WirePlumber, порталы и т.п.).\n"
+               "Они появятся ниже разделительной полосы."))
+        self.theme_switch.set_tooltip_text(tr("Тема: тёмная / светлая"))
+        try:
+            self.theme_switch.update_property([Gtk.AccessibleProperty.LABEL], [tr("Тёмная тема")])
+        except Exception:
+            pass
+        self.user_head.lbl.set_text(tr("Звук приложений").upper())
+        self.sys_head.lbl.set_text(tr("Служебные").upper())
+        self.refresh()
+
+    def _center_header_buttons(self):
+        """Крестик окна тянется на всю высоту шапки (овал) — центрируем, как остальные."""
+        def walk(w):
+            c = w.get_first_child()
+            while c is not None:
+                yield c
+                yield from walk(c)
+                c = c.get_next_sibling()
+        for w in walk(self._header):
+            if w.get_css_name() == "button":
+                w.set_valign(Gtk.Align.CENTER)
+        return False
+
+    def _theme_icons(self):
+        dark = self.theme_switch.get_active()
+        for icon, on in ((self.moon, dark), (self.sun, not dark)):
+            if on:
+                icon.add_css_class("on-knob")
+            else:
+                icon.remove_css_class("on-knob")
+
+    def on_theme_toggled(self, switch, _param):
+        name = "dark" if switch.get_active() else "light"
+        apply_theme(name)
+        ui = load_ui()
+        ui["theme"] = name
+        save_ui(ui)
+        self._theme_icons()
+
+    def on_key(self, controller, keyval, keycode, state):
+        if self.master.recording:
+            return False                         # идёт запись сочетания — окно не реагирует
+        accel = load_outputs_cfg()["hotkey"]
+        if accel and Gtk.accelerator_name(
+                keyval, state & Gtk.accelerator_get_default_mod_mask()) == accel:
+            next_output()
+            self.refresh()
+            return True
+        if keyval == Gdk.KEY_Escape:
+            self.close()
+            return True
+        return False
+
+    def on_system_toggled(self, btn):
+        ui = load_ui()
+        ui["show_system"] = btn.get_active()
+        save_ui(ui)
+        self.refresh()
+
+    # ── элементы оформления ─────────────────────────────────────────────────
+
+    def _make_list(self):
+        lb = Gtk.ListBox()
+        lb.set_selection_mode(Gtk.SelectionMode.NONE)
+        lb.add_css_class("mixer-list")
+        lb.set_valign(Gtk.Align.START)
+        return lb
+
+    def _section(self, text):
+        """Заголовок раздела с линией до правого края — она же и разделитель."""
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        box.set_margin_start(4)
+        box.set_margin_end(4)
+        box.set_margin_bottom(6)
+        lbl = Gtk.Label(label=text.upper(), xalign=0)
+        lbl.add_css_class("mixer-section")
+        box.lbl = lbl
+        box.append(lbl)
+        line = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        line.set_hexpand(True)
+        line.set_valign(Gtk.Align.CENTER)
+        box.append(line)
+        return box
+
+    # ── обновление ──────────────────────────────────────────────────────────
+
+    def refresh(self):
+        self.master.update(master_info())
+        apps = collect()
+        if not self.show_system.get_active():
+            apps = [a for a in apps if not a["system"]]
+
+        user = [a for a in apps if not a["system"]]
+        system = [a for a in apps if a["system"]]
+
+        self._fill(self.user_list, user)
+        self._fill(self.system_list, system)
+        self.system_box.set_visible(bool(system))
+
+        # подпись в шапке: сколько приложений и сколько из них сейчас звучит
+        if not apps:
+            sub = tr("нет источников звука")
+        else:
+            roots = [a for a in apps if not a["depth"]]
+            kids = len(apps) - len(roots)
+            sub = tr("приложений: %d") % len(roots)
+            if kids:
+                sub += tr(" · источников: %d") % kids
+            sub += tr(" · звучит: %d") % sum(1 for a in roots if a["live"])
+        self.title_widget.set_subtitle(sub)
+        # Строк стало больше/меньше (или включили раздел «служебные») — подгоняем
+        # высоту окна ровно под содержимое, чтобы внизу не оставалось пустого поля.
+        shown = sum(1 for r in self.rows.values() if r.get_parent() is not None)
+        if shown != self._rows_shown:
+            self._rows_shown = shown
+            GLib.idle_add(self._fit_height)
+        return True
+
+    def _fit_height(self):
+        """Высота окна = натуральная высота содержимого (шапка + строки).
+
+        Если строк больше, чем помещается на экране, окно не вылезает за
+        край: оно ограничивается высотой монитора, а список внутри начинает
+        прокручиваться колесом.
+        """
+        _, natural, _, _ = self.get_content().measure(
+            Gtk.Orientation.VERTICAL, max(1, self.get_width() or 880))
+        limit = 0
+        try:
+            display = Gdk.Display.get_default()
+            monitors = list(display.get_monitors()) if display else []
+            if monitors:
+                # берём меньшую сторону всех мониторов: окно (niri открывает его
+                # у курсора) не должно уезжать за край ни на одном из экранов
+                side = min(min(mon.get_geometry().width, mon.get_geometry().height)
+                           for mon in monitors)
+                limit = int(side * 0.8)
+        except Exception:
+            limit = 0
+        if limit and natural > limit:
+            natural = limit
+        if natural > 0:
+            self.set_default_size(self.get_width() or 880, natural)
+        return False
+
+    def _fill(self, listbox, apps):
+        """Приводит содержимое одного списка в соответствие с apps (по порядку)."""
+        want = {a["key"]: a for a in apps}
+
+        # убрать исчезнувшие
+        for key in list(self.rows):
+            row = self.rows[key]
+            if row.get_parent() is listbox and key not in want:
+                listbox.remove(row)
+                del self.rows[key]
+
+        # добавить новые / обновить существующие
+        for key, a in want.items():
+            row = self.rows.get(key)
+            if row is None:
+                row = AppRow(self, a)
+                self.rows[key] = row
+                listbox.append(row)
+            else:
+                parent = row.get_parent()
+                if parent is not listbox:
+                    if parent is not None:
+                        parent.remove(row)
+                    listbox.append(row)
+                row.update(a)
+
+        # положение строки в карточке: приложение + его источники — одна группа
+        for i, a in enumerate(apps):
+            row = self.rows.get(a["key"])
+            if row is None:
+                continue
+            nxt = apps[i + 1] if i + 1 < len(apps) else None
+            next_child = bool(nxt and nxt["depth"] and nxt["parent_key"] == (a["key"] if not a["depth"] else a["parent_key"]))
+            if a["depth"]:
+                row.set_group("mid" if next_child else "tail", last_child=not next_child)
+            else:
+                row.set_group("head" if next_child else "solo")
+
+        # порядок строк
+        for i, a in enumerate(apps):
+            row = self.rows.get(a["key"])
+            if row is not None and row.get_index() != i:
+                listbox.remove(row)
+                listbox.insert(row, i)
+
+    # ── отложенное применение ползунка ───────────────────────────────────────
+
+    def schedule_volume(self, row, vol):
+        key = row.app["key"]
+        row.pending_volume = vol
+        if key in self.pending:
+            return
+        self.pending[key] = GLib.timeout_add(APPLY_DELAY_MS, self._apply_pending, row)
+
+    def _apply_pending(self, row):
+        key = row.app["key"]
+        self.pending.pop(key, None)
+        vol = row.pending_volume
+        row.pending_volume = None
+        if vol is None:
+            return False
+        fresh = next((a for a in collect() if a["key"] == key), None) or row.app
+        set_volume(fresh, vol)
+        return False
+
+    def apply_mute(self, row, muted):
+        key = row.app["key"]
+        fresh = next((a for a in collect() if a["key"] == key), None) or row.app
+        set_mute(fresh, muted)
+        self.refresh()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Точка входа
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cli_list():
+    apps = collect()
+    print("%-24s %-6s %-34s %-6s %s" % ("ПРИЛОЖЕНИЕ", "ГРОМК", "ПОДПИСЬ", "ПОТОК", "ПАСПОРТ"))
+    for a in apps:
+        name = ("   └ " if a["depth"] else "") + a["label"]
+        state = a["sub"]
+        ident = " ".join("%s=%s" % (k.split(".")[-1], v) for k, v in a["ident"].items())
+        print("%-24s %-6s %-34s %-6d %s" % (
+            name[:24], "%d%%" % a["volume"], state[:34], len(a["streams"]), ident[:30],
+        ))
+
+
+def find_app(pattern):
+    """Приложение по подписи или ключу (без учёта регистра, по подстроке)."""
+    pat = pattern.lower()
+    apps = collect()
+    for a in apps:
+        if a["label"].lower() == pat or a["key"].lower() == pat:
+            return a
+    for a in apps:
+        if pat in a["key"].lower():
+            return a
+    for a in apps:
+        if pat in a["label"].lower():
+            return a
+    return None
+
+
+def cli_action(argv):
+    """appmixer --set Steam 30 / --mute Steam / --unmute Steam"""
+    def value(flag):
+        if flag in argv:
+            i = argv.index(flag)
+            return argv[i + 1] if i + 1 < len(argv) else None
+        return None
+
+    name = value("--set") or value("--mute") or value("--unmute")
+    if not name:
+        return None
+    app = find_app(name)
+    if not app:
+        print("не нашёл приложение: %s" % name, file=sys.stderr)
+        return 1
+
+    if "--set" in argv:
+        i = argv.index("--set")
+        try:
+            pct = int(argv[i + 2])
+        except (IndexError, ValueError):
+            print("нужно: --set <приложение> <проценты>", file=sys.stderr)
+            return 2
+        set_volume(app, pct)
+        print("%s -> %d%%" % (app["label"], pct))
+    elif "--mute" in argv:
+        set_mute(app, True)
+        print("%s заглушено" % app["label"])
+    else:
+        set_mute(app, False)
+        print("%s включено" % app["label"])
+    return 0
+
+
+def main():
+    if "--phantom" in sys.argv:
+        # внутренний режим: беззвучный поток + громкость ему (зовётся самим микшером)
+        i = sys.argv.index("--phantom")
+        try:
+            pct = int(sys.argv[i + 1])
+        except (IndexError, ValueError):
+            return 2
+        return phantom_worker(pct, sys.argv[i + 2:])
+    if "--list" in sys.argv:
+        cli_list()
+        return 0
+    if "--outputs" in sys.argv:
+        for o in list_outputs():
+            print("%s %-8s %s" % ("*" if o["default"] else " ",
+                                  "hidden" if o["hidden"] else ("dead" if o["dead"] else ""), o["label"]))
+        return 0
+    if "--next-output" in sys.argv or "--prev-output" in sys.argv:
+        set_language(resolve_lang(load_ui().get("lang")))
+        t = next_output(1 if "--next-output" in sys.argv else -1)
+        print(t["label"] if t else "no other outputs")
+        return 0 if t else 1
+    if "--daemon" in sys.argv:
+        return run_daemon()
+    if {"--set", "--mute", "--unmute"} & set(sys.argv):
+        code = cli_action(sys.argv)
+        if code is not None:
+            return code
+
+    set_language(resolve_lang(load_ui().get("lang")))
+    GLib.set_application_name(APP_TITLE)
+    Gtk.Window.set_default_icon_name(APP_ID)    # иконка из ~/.local/share/icons/hicolor
+    GLib.set_prgname(APP_ID)
+    app = Adw.Application(application_id=APP_ID)
+
+    def on_activate(a):
+        install_css()
+        win = a.get_active_window() or MixerWindow(a)
+        win.present()
+
+    app.connect("activate", on_activate)
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
