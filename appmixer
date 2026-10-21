@@ -167,7 +167,7 @@ THEMES = {
     "dark": {
         "FG": "white", "NAME_FG": "#f1f5f9", "SURFACE_BG": "#131313",
         "CARD_BG": "#1e1e1e", "CARD_HOVER": "#272727", "MASTER_BG": "#262626",
-        "CHILD_BG": "#191919", "CHILD_HOVER": "#232323",
+        "CHILD_BG": "#191919", "CHILD_HOVER": "#232323", "POP_BG": "#202020",
         "ACCENT": "#c8c8c8", "ACCENT_HOVER": "#e6e6e6",
         "LIVE_COLOR": "#22c55e", "LIVE_TEXT": "#4ade80",
         "BOOST_COLOR": "#f59e0b", "BOOST_TEXT": "#fbbf24",
@@ -178,7 +178,7 @@ THEMES = {
     "light": {
         "FG": "black", "NAME_FG": "#18181b", "SURFACE_BG": "#c9c9cb",
         "CARD_BG": "#e4e4e6", "CARD_HOVER": "#d9d9dc", "MASTER_BG": "#ececee",
-        "CHILD_BG": "#d8d8db", "CHILD_HOVER": "#cfcfd2",
+        "CHILD_BG": "#d8d8db", "CHILD_HOVER": "#cfcfd2", "POP_BG": "#f3f3f4",
         "ACCENT": "#52525b", "ACCENT_HOVER": "#27272a",
         "LIVE_COLOR": "#16a34a", "LIVE_TEXT": "#15803d",
         "BOOST_COLOR": "#d97706", "BOOST_TEXT": "#b45309",
@@ -199,7 +199,7 @@ def build_css(theme):
     t = THEMES.get(theme) or THEMES[DEFAULT_THEME]
     FG, NAME_FG, SURFACE_BG = t["FG"], t["NAME_FG"], t["SURFACE_BG"]
     CARD_BG, CARD_HOVER, MASTER_BG = t["CARD_BG"], t["CARD_HOVER"], t["MASTER_BG"]
-    CHILD_BG, CHILD_HOVER = t["CHILD_BG"], t["CHILD_HOVER"]
+    CHILD_BG, CHILD_HOVER, POP_BG = t["CHILD_BG"], t["CHILD_HOVER"], t["POP_BG"]
     ACCENT, ACCENT_HOVER = t["ACCENT"], t["ACCENT_HOVER"]
     LIVE_COLOR, LIVE_TEXT = t["LIVE_COLOR"], t["LIVE_TEXT"]
     BOOST_COLOR, BOOST_TEXT = t["BOOST_COLOR"], t["BOOST_TEXT"]
@@ -246,6 +246,9 @@ window.mixer-win headerbar:backdrop .subtitle {{
 }}
 window.mixer-win windowcontrols button,
 window.mixer-win windowcontrols:backdrop button {{ color: alpha({FG}, 0.72); opacity: 1; }}
+/* у окна не в фокусе libadwaita приглушает всю шапку — нам это мешает читать подписи */
+window.mixer-win headerbar > windowhandle > box,
+window.mixer-win:backdrop headerbar > windowhandle > box {{ opacity: 1; }}
 
 /* ── карточка: приложение + его источники склеены в одну группу ───────────── */
 row.mixer-row {{
@@ -402,6 +405,28 @@ row.mixer-row.child .mixer-tile {{
     border-radius: 7px;
 }}
 row.mixer-row.child .mixer-tile-letter {{ font-size: 12px; }}
+
+/* ── выпадающие меню (выход, язык): в светлой теме libadwaita оставляет их тёмными */
+popover.background > contents,
+popover > contents {{
+    background-color: {POP_BG};
+    color: {NAME_FG};
+    border: 1px solid alpha({FG}, 0.12);
+    border-radius: 12px;
+}}
+popover.background > arrow,
+popover > arrow {{
+    background-color: {POP_BG};
+    border: 1px solid alpha({FG}, 0.12);
+}}
+popover button:not(.output-action):not(.flat) {{
+    background-color: alpha({FG}, 0.08);
+    color: {NAME_FG};
+}}
+popover button:not(.output-action):not(.flat):hover {{ background-color: alpha({FG}, 0.14); }}
+popover button.flat {{ color: {NAME_FG}; }}
+popover button.flat:hover {{ background-color: alpha({FG}, 0.10); }}
+popover checkbutton, popover expander title {{ color: {NAME_FG}; }}
 
 /* ── кнопка выбора выхода (подпись под «Общая громкость») ──────────────── */
 button.output-button {{

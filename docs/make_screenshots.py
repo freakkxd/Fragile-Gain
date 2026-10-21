@@ -31,7 +31,7 @@ def app(label, hint, vol=100, live=False, mute=False, title="", system=False, ki
 
 SCENARIOS = {
     "overview": dict(
-        lang="ru", theme="dark", menu=None, master=("Built-in Audio Analog Stereo", 62, False),
+        lang="ru", theme="light", menu=None, master=("Built-in Audio Analog Stereo", 62, False),
         apps=[
             app("Anki", "anki", 90, live=False, kids=[
                 app("mpv", "mpv", 100, live=True, title="привет_hello_0412.mp3")]),
@@ -45,7 +45,7 @@ SCENARIOS = {
             app("wireplumber", "", 100, system=True),
             app("xdg-desktop-portal", "", 100, system=True),
         ]),
-    "light": dict(
+    "english": dict(
         lang="en", theme="light", menu=None, master=("MiniFuse 2 Main Output L/R", 100, False),
         apps=[
             app("Dopamine", "dopamine", 85, live=True, title="Radiohead — Weird Fishes"),
@@ -60,7 +60,7 @@ SCENARIOS = {
             app("pw-cat", "", 100, system=True),
         ]),
     "outputs": dict(
-        lang="ru", theme="dark", menu="outputs", master=("Built-in Audio Analog Stereo", 48, False),
+        lang="ru", theme="light", menu="outputs", master=("Built-in Audio Analog Stereo", 48, False),
         apps=[
             app("Firefox", "", 100, live=True, title="Tiny Desk Concert - YouTube"),
             app("Lutris", "lutris", 100, live=False, kids=[
@@ -74,7 +74,7 @@ SCENARIOS = {
             app("xdg-desktop-portal-gtk", "", 100, system=True),
         ]),
     "language": dict(
-        lang="de", theme="dark", menu="language", master=("MiniFuse 2 Main Output L/R", 80, False),
+        lang="de", theme="light", menu="language", master=("MiniFuse 2 Main Output L/R", 80, False),
         apps=[
             app("Audacity", "", 100, live=True, title="Aufnahme_2025-10-21.wav"),
             app("Chromium", "", 100, live=True, title="Podcast #142: Linux-Audio"),
@@ -84,7 +84,7 @@ SCENARIOS = {
             app("pipewire-pulse", "", 100, system=True),
         ]),
     "japanese": dict(
-        lang="ja", theme="dark", menu=None, master=("USB Audio DAC", 70, False),
+        lang="ja", theme="light", menu=None, master=("USB Audio DAC", 70, False),
         apps=[
             app("Plex", "", 100, live=True, title="久石譲 — Summer"),
             app("Rhythmbox", "", 100, kids=[
