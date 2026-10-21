@@ -233,12 +233,7 @@ flatpak/snap. Если ничего не нашлось (служебные пр
 
 ```sh
 python3 docs/make_screenshots.py            # перегенерировать скриншоты (демо-данные, настройки не трогает)
-python3 design/gen_wave.py out.svg          # иконка приложения
-python3 design/gen_wave.py out.svg --tray "#ffffff"   # знак для трея заданного цвета
 ```
-
-Дизайн подобран по скиллу ui-ux-pro-max (Data-Dense Dashboard, серая палитра); цвета обеих тем — словарь `THEMES`
-в `appmixer`.
 
 ## Удаление
 
