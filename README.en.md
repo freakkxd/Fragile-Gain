@@ -112,4 +112,4 @@ python3 design/gen_wave.py out.svg --tray "#ffffff"   # tray mark in a given col
 
 ## License
 
-No license has been chosen yet; without a `LICENSE` file all rights are reserved by the author.
+MIT — see [LICENSE](LICENSE).
