@@ -6,8 +6,9 @@
 Настройки пользователя и аудиосистема не затрагиваются.
 
 Использование:
-  python3 docs/make_screenshots.py            # все сценарии → docs/screenshots/*.png
-  python3 docs/make_screenshots.py overview   # один сценарий
+  python3 docs/make_screenshots.py                      # все сценарии в обеих темах → docs/screenshots/{light,dark}/*.png
+  python3 docs/make_screenshots.py overview             # один сценарий
+  python3 docs/make_screenshots.py --theme=dark         # только тёмная тема
 Нужны PyGObject, GTK 4, libadwaita и Pillow.
 """
 import importlib.machinery
@@ -31,7 +32,7 @@ def app(label, hint, vol=100, live=False, mute=False, title="", system=False, ki
 
 SCENARIOS = {
     "overview": dict(
-        lang="ru", theme="light", menu=None, master=("Built-in Audio Analog Stereo", 62, False),
+        lang="ru", menu=None, master=("Built-in Audio Analog Stereo", 62, False),
         apps=[
             app("Anki", "anki", 90, live=False, kids=[
                 app("mpv", "mpv", 100, live=True, title="привет_hello_0412.mp3")]),
@@ -46,7 +47,7 @@ SCENARIOS = {
             app("xdg-desktop-portal", "", 100, system=True),
         ]),
     "english": dict(
-        lang="en", theme="light", menu=None, master=("MiniFuse 2 Main Output L/R", 100, False),
+        lang="en", menu=None, master=("MiniFuse 2 Main Output L/R", 100, False),
         apps=[
             app("Dopamine", "dopamine", 85, live=True, title="Radiohead — Weird Fishes"),
             app("OBS Studio", "obs", 65, live=False, mute=True),
@@ -60,7 +61,7 @@ SCENARIOS = {
             app("pw-cat", "", 100, system=True),
         ]),
     "outputs": dict(
-        lang="ru", theme="light", menu="outputs", master=("Built-in Audio Analog Stereo", 48, False),
+        lang="ru", menu="outputs", master=("Built-in Audio Analog Stereo", 48, False),
         apps=[
             app("Firefox", "", 100, live=True, title="Tiny Desk Concert - YouTube"),
             app("Lutris", "lutris", 100, live=False, kids=[
@@ -74,7 +75,7 @@ SCENARIOS = {
             app("xdg-desktop-portal-gtk", "", 100, system=True),
         ]),
     "language": dict(
-        lang="de", theme="light", menu="language", master=("MiniFuse 2 Main Output L/R", 80, False),
+        lang="de", menu="language", master=("MiniFuse 2 Main Output L/R", 80, False),
         apps=[
             app("Audacity", "", 100, live=True, title="Aufnahme_2025-10-21.wav"),
             app("Chromium", "", 100, live=True, title="Podcast #142: Linux-Audio"),
@@ -84,7 +85,7 @@ SCENARIOS = {
             app("pipewire-pulse", "", 100, system=True),
         ]),
     "japanese": dict(
-        lang="ja", theme="light", menu=None, master=("USB Audio DAC", 70, False),
+        lang="ja", menu=None, master=("USB Audio DAC", 70, False),
         apps=[
             app("Plex", "", 100, live=True, title="久石譲 — Summer"),
             app("Rhythmbox", "", 100, kids=[
@@ -95,7 +96,7 @@ SCENARIOS = {
             app("xdg-desktop-portal-kde", "", 100, system=True),
         ]),
     "ukrainian": dict(
-        lang="uk", theme="light", menu=None, master=("HDMI / DisplayPort (HP X24c)", 90, False),
+        lang="uk", menu=None, master=("HDMI / DisplayPort (HP X24c)", 90, False),
         apps=[
             app("Audacious", "", 100, live=True, title="Океан Ельзи — Обійми"),
             app("Chrome", "", 100, mute=True),
@@ -125,9 +126,9 @@ def load_module():
     return mod
 
 
-def run_scenario(name):
-    """Один сценарий в отдельном процессе: отрисовать окно и сохранить PNG."""
-    sc = SCENARIOS[name]
+def run_scenario(name, theme):
+    """Один сценарий в одной теме (отдельный процесс): отрисовать окно, сохранить PNG."""
+    sc = dict(SCENARIOS[name], theme=theme)
     m = load_module()
     from gi.repository import Adw, GLib, Gdk, Graphene, Gtk
 
@@ -246,9 +247,10 @@ def run_scenario(name):
             (pad, pad + 10 * SCALE, pad + shot.width, pad + shot.height + 10 * SCALE), radius, fill=(0, 0, 0, 150))
         canvas.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(16 * SCALE)))
         canvas.alpha_composite(shot, (pad, pad))
-        OUT.mkdir(parents=True, exist_ok=True)
-        canvas.save(OUT / ("%s.png" % name), optimize=True)
-        print("saved", OUT / ("%s.png" % name))
+        target = OUT / theme
+        target.mkdir(parents=True, exist_ok=True)
+        canvas.save(target / ("%s.png" % name), optimize=True)
+        print("saved", target / ("%s.png" % name))
         app_.quit()
         return False
 
@@ -276,16 +278,19 @@ def run_scenario(name):
 
 
 def main():
-    names = sys.argv[1:] or list(SCENARIOS)
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    themes = [a[len("--theme="):] for a in sys.argv[1:] if a.startswith("--theme=")] or ["light", "dark"]
+    names = args or list(SCENARIOS)
     for n in names:
         if n not in SCENARIOS:
             sys.exit("неизвестный сценарий: %s (есть: %s)" % (n, ", ".join(SCENARIOS)))
-        subprocess.run([sys.executable, __file__, n, "--inner"], check=False)
+        for th in themes:
+            subprocess.run([sys.executable, __file__, n, th, "--inner"], check=False)
 
 
 if __name__ == "__main__":
     if "--inner" in sys.argv:
-        sys.argv = [a for a in sys.argv if a != "--inner"]
-        run_scenario(sys.argv[1])
+        rest = [a for a in sys.argv[1:] if a != "--inner"]
+        run_scenario(rest[0], rest[1])
     else:
         main()

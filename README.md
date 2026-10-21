@@ -7,10 +7,14 @@
 [English version → README.en.md](README.en.md)
 
 <p align="center">
-  <img src="docs/screenshots/overview.png" alt="Fragile Gain: общий вид" width="720">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/dark/overview.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/light/overview.png">
+    <img src="docs/screenshots/light/overview.png" alt="Fragile Gain: общий вид" width="720">
+  </picture>
 </p>
 
-> Все скриншоты — в светлой теме (тёмная включается переключателем в шапке). Сделаны скриптом [`docs/make_screenshots.py`](docs/make_screenshots.py) на демонстрационных данных
+> Скриншоты в обеих темах (светлой и тёмной). Сделаны скриптом [`docs/make_screenshots.py`](docs/make_screenshots.py) на демонстрационных данных
 > (приложения, вкладки и устройства — вымышленные), чтобы в кадр не попало ничего личного.
 
 ## Зачем он, если есть pavucontrol
@@ -39,14 +43,35 @@ Fragile Gain показывает **все запущенные приложен
 
 ## Скриншоты
 
+Тема переключается кнопкой «солнце / луна» в шапке окна; ниже все кадры в обеих темах — выберите, какую показать.
+
+<details open>
+<summary><b>Тёмная тема</b></summary>
+
 | | |
 |:--:|:--:|
-| ![Дерево Anki → mpv, звучащие и служебные](docs/screenshots/overview.png) | ![English: буст, мьют, Steam → steamwebhelper](docs/screenshots/english.png) |
+| ![Дерево Anki → mpv, звучащие и служебные](docs/screenshots/dark/overview.png) | ![English: буст, мьют, Steam → steamwebhelper](docs/screenshots/dark/english.png) |
 | Дерево `Anki → mpv`, играющие приложения, служебные внизу | English: громкость выше 100 % (янтарный), мьют, `Steam → steamwebhelper` |
-| ![Меню выходов](docs/screenshots/outputs.png) | ![Меню языка](docs/screenshots/language.png) |
+| ![Меню выходов](docs/screenshots/dark/outputs.png) | ![Меню языка](docs/screenshots/dark/language.png) |
 | Меню устройства вывода: выбор, «скрыть» (глаз), «недоступен», скрытые, горячая клавиша | Меню языка (Deutsch) — 13 языков и «Как в системе» |
-| ![Японский интерфейс](docs/screenshots/japanese.png) | ![Украинский интерфейс](docs/screenshots/ukrainian.png) |
+| ![Японский интерфейс](docs/screenshots/dark/japanese.png) | ![Украинский интерфейс](docs/screenshots/dark/ukrainian.png) |
 | 日本語: `Rhythmbox → gst-play-1.0` | Українська: `Kodi → ffplay`, мьют, буст |
+
+</details>
+
+<details>
+<summary><b>Светлая тема</b></summary>
+
+| | |
+|:--:|:--:|
+| ![Дерево Anki → mpv, звучащие и служебные](docs/screenshots/light/overview.png) | ![English: буст, мьют, Steam → steamwebhelper](docs/screenshots/light/english.png) |
+| Дерево `Anki → mpv`, играющие приложения, служебные внизу | English: громкость выше 100 % (янтарный), мьют, `Steam → steamwebhelper` |
+| ![Меню выходов](docs/screenshots/light/outputs.png) | ![Меню языка](docs/screenshots/light/language.png) |
+| Меню устройства вывода: выбор, «скрыть» (глаз), «недоступен», скрытые, горячая клавиша | Меню языка (Deutsch) — 13 языков и «Как в системе» |
+| ![Японский интерфейс](docs/screenshots/light/japanese.png) | ![Украинский интерфейс](docs/screenshots/light/ukrainian.png) |
+| 日本語: `Rhythmbox → gst-play-1.0` | Українська: `Kodi → ffplay`, мьют, буст |
+
+</details>
 
 ## Установка
 
