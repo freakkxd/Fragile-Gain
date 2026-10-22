@@ -727,10 +727,11 @@ def load_store():
             data.setdefault("volumes", {})
             data.setdefault("prev", {})
             data.setdefault("ident", {})
+            data.setdefault("muted", {})
             return data
     except Exception:
         pass
-    return {"volumes": {}, "prev": {}, "ident": {}}
+    return {"volumes": {}, "prev": {}, "ident": {}, "muted": {}}
 
 
 def save_store(store):
@@ -1430,17 +1431,40 @@ def self_command():
 
 
 def run_daemon():
-    """Фоновый режим: глобальный хоткей через xdg-desktop-portal GlobalShortcuts.
+    """Фоновый режим без окна.
 
-    Работает там, где компоновщик это поддерживает (KDE Plasma, GNOME 48+). В niri,
-    sway и Hyprland портал отказывает — тогда привяжите команду --next-output в
-    конфиге компоновщика (её показывает окно)."""
+    1. Страж громкости: новым потокам (приложение начало играть заново) сразу
+       выставляется запомненная в микшере громкость — без этого они стартуют со
+       100 %. Работает везде, где есть PipeWire/PulseAudio.
+    2. Глобальный хоткей смены выхода через xdg-desktop-portal GlobalShortcuts —
+       там, где компоновщик это поддерживает (KDE Plasma, GNOME 48+). В niri, sway
+       и Hyprland портал отказывает: страж всё равно работает, а хоткей нужно
+       привязать командой --next-output в конфиге компоновщика.
+    """
+    loop = GLib.MainLoop()
+    guard = VolumeGuard()
+    if not guard.start():
+        print("не удалось запустить слежение за потоками (нет pactl?)", file=sys.stderr)
+        return 3
+    print("страж громкости запущен: новые потоки получат запомненную громкость")
+
     accel = load_outputs_cfg()["hotkey"]
     trigger = accel_to_portal(accel)
+    if trigger:
+        try:
+            _bind_global_hotkey(trigger)
+        except Exception as exc:
+            print("глобальный хоткей недоступен: %s (привяжите команду %s в конфиге компоновщика)"
+                  % (exc, self_command()), file=sys.stderr)
+    loop.run()
+    return 0
+
+
+def _bind_global_hotkey(trigger):
+    """Регистрация хоткея в портале. Ошибки не фатальны для фонового режима."""
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-    loop = GLib.MainLoop()
     sender = bus.get_unique_name()[1:].replace(".", "_")
-    state = {"sess": None, "ok": False}
+    state = {"sess": None}
     PORTAL = ("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
 
     def request(token, cb):
@@ -1453,16 +1477,13 @@ def run_daemon():
         if code != 0:
             print("портал не поддерживает глобальные сочетания в этом окружении "
                   "(привяжите команду %s в конфиге компоновщика)" % self_command(), file=sys.stderr)
-            loop.quit()
             return
-        state["ok"] = True
         print("глобальный хоткей %s зарегистрирован" % trigger)
 
     def on_session(conn, sname, path, iface, sig, params, _):
         code, res = params.unpack()
         if code != 0:
             print("не удалось создать сессию GlobalShortcuts", file=sys.stderr)
-            loop.quit()
             return
         state["sess"] = res["session_handle"]
         request("fgbind", on_bound)
@@ -1478,22 +1499,13 @@ def run_daemon():
         if params.unpack()[1] == "next-output":
             next_output()
 
-    if not trigger:
-        print("в настройках не задано сочетание клавиш", file=sys.stderr)
-        return 2
     bus.signal_subscribe(PORTAL[0], "org.freedesktop.portal.GlobalShortcuts", "Activated",
                          PORTAL[1], None, Gio.DBusSignalFlags.NONE, on_activated, None)
     request("fgsession", on_session)
-    try:
-        bus.call_sync(PORTAL[0], PORTAL[1], "org.freedesktop.portal.GlobalShortcuts", "CreateSession",
-                      GLib.Variant("(a{sv})", ({"handle_token": GLib.Variant("s", "fgsession"),
-                                                "session_handle_token": GLib.Variant("s", "fgsess")},)),
-                      GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, 5000, None)
-    except Exception as exc:
-        print("портал GlobalShortcuts недоступен: %s" % exc, file=sys.stderr)
-        return 3
-    loop.run()
-    return 0 if state["ok"] else 3
+    bus.call_sync(PORTAL[0], PORTAL[1], "org.freedesktop.portal.GlobalShortcuts", "CreateSession",
+                  GLib.Variant("(a{sv})", ({"handle_token": GLib.Variant("s", "fgsession"),
+                                            "session_handle_token": GLib.Variant("s", "fgsess")},)),
+                  GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, 5000, None)
 
 
 ALSA_NAME_RE = re.compile(r"^PipeWire ALSA \[(.+?)\]$")
@@ -1997,7 +2009,13 @@ def set_mute(row, muted):
     if targets:
         for si in targets:
             run(["pactl", "set-sink-input-mute", str(si["index"]), "1" if muted else "0"])
-        remember(row, row["volume"])
+        store = remember(row, row["volume"])
+        for r in [row] + list(row.get("children") or []):
+            if muted:
+                store["muted"][r["key"]] = True
+            else:
+                store["muted"].pop(r["key"], None)
+        save_store(store)
         return
     # WirePlumber не сохраняет флаг mute из свойств потока, поэтому «мьют»
     # молчащего приложения = запомненная громкость 0; прежнюю храним сами.
@@ -2019,6 +2037,102 @@ def set_mute(row, muted):
     if row.get("ident"):
         store["ident"][key] = row["ident"]
     save_store(store)
+
+
+class VolumeGuard:
+    """Держит запомненную громкость у НОВЫХ потоков.
+
+    Когда приложение начинает играть заново, система создаёт ему новый поток со
+    100 % — и звук на время «прыгает» на полную, пока громкость не поправят руками.
+    Страж слушает события PipeWire (`pactl subscribe`) и сразу выставляет новому
+    потоку громкость и мьют, которые вы задавали этой строке в микшере. Уже
+    играющие потоки он не трогает (их вы двигаете сами).
+    """
+
+    FRESH = 2.5     # секунд после появления поток перепроверяем: приложение может
+                    # выставить свою громкость уже после создания потока
+
+    def __init__(self, on_fix=None):
+        self.on_fix = on_fix
+        self.seen = set()
+        self.fresh = {}
+        self.proc = None
+        self.stream = None
+
+    def start(self):
+        for si in pactl_json("sink-inputs"):
+            self.seen.add(si.get("index"))            # то, что играет сейчас, не трогаем
+        try:
+            self.proc = Gio.Subprocess.new(
+                ["pactl", "subscribe"],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
+        except Exception:
+            return False
+        self.stream = Gio.DataInputStream.new(self.proc.get_stdout_pipe())
+        self._read()
+        return True
+
+    def stop(self):
+        if self.proc is not None:
+            try:
+                self.proc.force_exit()
+            except Exception:
+                pass
+            self.proc = None
+
+    def _read(self):
+        self.stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_line)
+
+    def _on_line(self, stream, res):
+        try:
+            line, _length = stream.read_line_finish_utf8(res)
+        except Exception:
+            line = None
+        if line is None:                              # pactl завершился — поднимаем заново
+            if self.proc is not None:
+                GLib.timeout_add_seconds(3, self._restart)
+            return
+        if "'new' on sink-input" in line:
+            for delay in (0, 300, 1200):              # сразу и ещё пару раз: вдруг приложение переставит
+                GLib.timeout_add(delay, self._check_once)
+        self._read()
+
+    def _restart(self):
+        self.stop()
+        self.proc = None
+        self.start()
+        return False
+
+    def _check_once(self):
+        self.apply(collect())
+        return False
+
+    def apply(self, rows):
+        """Выставить запомненные громкость/мьют новым потокам строк. Возвращает, менял ли."""
+        now = time.monotonic()
+        store = load_store()
+        volumes, muted = store["volumes"], store.get("muted", {})
+        changed = False
+        for row in rows:
+            want = volumes.get(row["key"])
+            want_mute = muted.get(row["key"])
+            for si in row.get("streams") or []:
+                idx = si.get("index")
+                first = idx not in self.seen
+                if not first and now >= self.fresh.get(idx, 0):
+                    continue
+                self.seen.add(idx)
+                if first:
+                    self.fresh[idx] = now + self.FRESH
+                if want is not None and stream_volume(si) != want:
+                    run(["pactl", "set-sink-input-volume", str(idx), "%d%%" % want])
+                    changed = True
+                if want_mute and not si.get("mute"):
+                    run(["pactl", "set-sink-input-mute", str(idx), "1"])
+                    changed = True
+        if changed and self.on_fix:
+            self.on_fix()
+        return changed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2842,6 +2956,9 @@ class MixerWindow(Adw.ApplicationWindow):
         keys.connect("key-pressed", self.on_key)
         self.add_controller(keys)
 
+        self.guard = VolumeGuard(on_fix=lambda: GLib.idle_add(self.refresh))
+        self.guard.start()
+        self.connect("close-request", lambda *_: (self.guard.stop(), False)[1])
         GLib.timeout_add(REFRESH_MS, self.refresh)
         self.show_system.connect("toggled", self.on_system_toggled)
         self.refresh()
@@ -3020,6 +3137,7 @@ class MixerWindow(Adw.ApplicationWindow):
     def refresh(self):
         self.master.update(master_info())
         apps = collect()
+        self.guard.apply(apps)                  # подстраховка к событиям: новые потоки — на запомненную громкость
         if not self.show_system.get_active():
             apps = [a for a in apps if not a["system"]]
 

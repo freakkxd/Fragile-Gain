@@ -15,7 +15,7 @@
 #   ~/.local/share/applications/ru.fragilich.appmixer.desktop   запись в меню приложений
 #
 # Использование: ./install.sh [--check] [--yes] [--no-deps] [--uninstall [--purge]]
-#                              [--distro ID] [--dry-run] [--help]
+#                              [--autostart | --no-autostart] [--distro ID] [--dry-run] [--help]
 
 set -u
 
@@ -38,6 +38,8 @@ SKIP_DEPS=0
 PURGE=0
 DRY=0
 FORCE_DISTRO=""
+AUTOSTART=ask     # ask | yes | no — запуск фонового режима (--daemon) при входе в сессию
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
 
 # ── сообщения: русский, если локаль русская ─────────────────────────────────
 case "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" in ru*) UI=ru ;; *) UI=en ;; esac
@@ -66,6 +68,8 @@ $(t 'Использование' 'Usage'): ./install.sh [options]
   --no-deps         $(t 'не ставить системные пакеты (зависимости всё равно проверяются)' 'do not install system packages (dependencies are still checked)')
   --uninstall       $(t 'удалить программу (настройки остаются)' 'remove the app (settings are kept)')
   --purge           $(t 'вместе с --uninstall: удалить и настройки' 'with --uninstall: also remove settings')
+  --autostart       $(t 'запускать фоновый режим при входе (держит громкость новых потоков, хоткей)' 'start the background mode at login (keeps volumes on new streams, hotkey)')
+  --no-autostart    $(t 'не предлагать автозапуск' 'do not offer autostart')
   --distro ID       $(t 'считать дистрибутив ID (arch, debian, fedora, suse) — для проверки' 'pretend the distro is ID (arch, debian, fedora, suse) — for testing')
   --dry-run         $(t 'только показать, что было бы сделано' 'only show what would be done')
   -h, --help        $(t 'эта справка' 'this help')
@@ -80,6 +84,8 @@ while [ $# -gt 0 ]; do
         --uninstall) MODE=uninstall ;;
         --purge) PURGE=1 ;;
         --dry-run) DRY=1 ;;
+        --autostart) AUTOSTART=yes ;;
+        --no-autostart) AUTOSTART=no ;;
         --distro) shift; FORCE_DISTRO="${1:-}" ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "$(t 'неизвестный параметр' 'unknown option'): $1" ;;
@@ -327,6 +333,8 @@ EOF
     command -v update-desktop-database >/dev/null 2>&1 && run update-desktop-database "$APPS_DIR" >/dev/null 2>&1
     command -v gtk-update-icon-cache >/dev/null 2>&1 && run gtk-update-icon-cache -f -t "$DATA_HOME/icons/hicolor" >/dev/null 2>&1
 
+    setup_autostart
+
     case ":$PATH:" in
         *":$BIN_DIR:"*) ;;
         *) warn "$BIN_DIR $(t 'нет в PATH — команда fragile-gain не найдётся; добавьте его в PATH или запускайте из меню приложений' 'is not in PATH — add it, or launch from the application menu')" ;;
@@ -345,6 +353,36 @@ EOF
     echo "    $(t 'Переключение выхода из командной строки' 'Switch output from the command line'): fragile-gain --next-output"
 }
 
+setup_autostart() {
+    # Фоновый режим держит запомненную громкость у НОВЫХ потоков (иначе приложение,
+    # начавшее играть заново, стартует со 100 %) и обрабатывает глобальный хоткей.
+    local want=0
+    case "$AUTOSTART" in
+        yes) want=1 ;;
+        ask) if [ "$ASSUME_YES" = 0 ] && [ -t 0 ] && ask "Запускать фоновый режим при входе (держит громкость у новых потоков и хоткей)?" "Start the background mode at login (keeps volumes on new streams, hotkey)?"; then want=1; fi ;;
+    esac
+    [ "$want" = 1 ] || return 0
+    run mkdir -p "$AUTOSTART_DIR"
+    if [ "$DRY" = 1 ]; then
+        printf '  %s+ write %s/%s-daemon.desktop%s\n' "$D" "$AUTOSTART_DIR" "$APP_ID" "$N"
+    else
+        cat >"$AUTOSTART_DIR/$APP_ID-daemon.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=$APP_TITLE (background)
+Comment=Keeps remembered volumes on new streams and handles the output hotkey
+Exec=$PREFIX/appmixer --daemon
+Icon=$APP_ID
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+DESKTOP
+    fi
+    ok "$(t 'автозапуск фонового режима' 'background mode autostart'): $AUTOSTART_DIR/$APP_ID-daemon.desktop"
+    warn "$(t 'Если ваше окружение не читает ~/.config/autostart (например, niri без xdg-autostart), добавьте запуск в его конфиг, для niri: spawn-at-startup "fragile-gain" "--daemon"' 'If your session does not read ~/.config/autostart (e.g. niri without xdg-autostart), start it from its config; for niri: spawn-at-startup "fragile-gain" "--daemon"')"
+}
+
 do_uninstall() {
     info "$(t 'Удаление' 'Uninstalling')"
     if [ -d "$PREFIX" ]; then
@@ -358,7 +396,7 @@ do_uninstall() {
     else
         warn "$(t 'программа не установлена' 'not installed'): $PREFIX"
     fi
-    run rm -f "$BIN_DIR/fragile-gain" "$APPS_DIR/$APP_ID.desktop" "$ICON_DIR/$APP_ID.svg"
+    run rm -f "$BIN_DIR/fragile-gain" "$APPS_DIR/$APP_ID.desktop" "$ICON_DIR/$APP_ID.svg" "$AUTOSTART_DIR/$APP_ID-daemon.desktop"
     command -v update-desktop-database >/dev/null 2>&1 && run update-desktop-database "$APPS_DIR" >/dev/null 2>&1
     ok "$(t 'ссылка, запись меню и иконка удалены' 'launcher, menu entry and icon removed')"
 }

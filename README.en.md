@@ -96,6 +96,7 @@ It installs into your home directory (no root needed; `sudo` is only used for sy
 ./install.sh --check            only check, change nothing
 ./install.sh --yes              no questions (agree to install packages)
 ./install.sh --no-deps          do not install system packages (still checks)
+./install.sh --autostart        start the background mode (--daemon) at login
 ./install.sh --dry-run          show what would be done
 ./install.sh --uninstall        remove the app (settings kept; --purge removes them too)
 ```
@@ -116,13 +117,23 @@ fragile-gain --set "Anki/mpv" 40  # nested source by row key
 fragile-gain --mute Telegram      # mute;  --unmute to restore
 fragile-gain --outputs            # list audio outputs
 fragile-gain --next-output        # switch to the next visible, available output (--prev-output: previous)
-fragile-gain --daemon             # background hotkey via xdg-desktop-portal (KDE Plasma, GNOME 48+)
+fragile-gain --daemon             # background mode: volume guard for new streams + hotkey via portal (KDE, GNOME 48+)
 ```
 
 **Output hotkey.** Set it in the output menu (click the device name under "Master volume"). It works while the app is
 running. Global keys outside the window depend on your desktop: on KDE Plasma / GNOME 48+ use `fragile-gain --daemon`;
 on niri, sway and Hyprland bind the command in the compositor config, e.g. niri:
 `Ctrl+XF86AudioMute allow-when-locked=true { spawn-sh "$HOME/.local/bin/fragile-gain --next-output"; }`.
+
+## Volumes do not jump to 100 %
+
+When an app starts playing again the system creates a **new stream at 100 %**, so the sound is briefly at full
+volume. The *volume guard* listens to PipeWire events (`pactl subscribe`) and immediately applies the volume and
+mute you set for that row to every new stream (re-checking a couple of times, since an app may set its own volume a
+moment later). Streams that are already playing are left alone. It works for all apps and nested sources.
+
+The guard runs while the window is open or while the **background mode** `fragile-gain --daemon` is running — add it
+to autostart for permanent protection: `./install.sh --autostart` (niri: `spawn-at-startup "fragile-gain" "--daemon"`).
 
 ## Settings
 
