@@ -942,19 +942,35 @@ def client_label(name, binary, pid):
     return PRETTY_BINARY.get(name.lower()) or name
 
 
+_PROCS = {}
+_PROCS_AT = 0.0
+
+
 def snapshot_procs():
     """Срез процессов: {pid: {"comm": имя, "ppid": родитель}}.
 
     Для скриптов с шебангом comm — имя самого скрипта: у Anki это «anki», хотя
     реально запущен python3.14. Именно это и нужно, чтобы строить дерево.
     """
-    procs = {}
+    # Read once per process: the window refreshes every second and re-reading all ~500
+    # /proc/*/stat files each time was most of its CPU. New processes are read at once,
+    # gone ones dropped; everything is re-read every 10 s (a parent can change on reparenting).
+    global _PROCS_AT
     try:
         entries = os.listdir("/proc")
     except OSError:
-        return procs
+        return {}
+    now = time.monotonic()
+    if now - _PROCS_AT > 10:
+        _PROCS.clear()
+        _PROCS_AT = now
+    alive = set()
     for entry in entries:
         if not entry.isdigit():
+            continue
+        pid = int(entry)
+        alive.add(pid)
+        if pid in _PROCS:
             continue
         try:
             stat = Path("/proc/%s/stat" % entry).read_text()
@@ -962,13 +978,15 @@ def snapshot_procs():
             continue
         cut = stat.rindex(")")
         try:
-            procs[int(entry)] = {
+            _PROCS[pid] = {
                 "comm": stat[stat.index("(") + 1:cut],
                 "ppid": int(stat[cut + 2:].split()[1]),
             }
         except (ValueError, IndexError):
             continue
-    return procs
+    for pid in [p for p in _PROCS if p not in alive]:
+        del _PROCS[pid]
+    return {pid: dict(info) for pid, info in _PROCS.items()}
 
 
 def is_ignored(comm):
@@ -2221,7 +2239,28 @@ class Marquee(Gtk.ScrolledWindow):
         self.set_child(self.label)
         self._t0 = None
         self._text = None
-        self.add_tick_callback(self._tick)
+        # A tick callback makes GTK redraw the window on every frame for as long as it is
+        # registered — so it runs only while the text really overflows and is on screen.
+        self._tick_id = 0
+        self.get_hadjustment().connect("changed", lambda *_: self._sync_ticking())
+        self.connect("map", lambda *_: self._sync_ticking())
+        self.connect("unmap", lambda *_: self._sync_ticking())
+
+    def _overflows(self):
+        adj = self.get_hadjustment()
+        return adj.get_upper() - adj.get_page_size() > 1
+
+    def _sync_ticking(self):
+        want = self.get_mapped() and self._overflows()
+        if want and not self._tick_id:
+            self._t0 = None
+            self._tick_id = self.add_tick_callback(self._tick)
+        elif not want and self._tick_id:
+            self.remove_tick_callback(self._tick_id)
+            self._tick_id = 0
+            self._t0 = None
+            if self.get_hadjustment().get_value():
+                self.get_hadjustment().set_value(0)
 
     def set_text(self, text):
         if text != self._text:
@@ -2229,15 +2268,17 @@ class Marquee(Gtk.ScrolledWindow):
             self.label.set_text(text)
             self._t0 = None
             self.get_hadjustment().set_value(0)
+            self._sync_ticking()
 
     def _tick(self, widget, clock):
         adj = self.get_hadjustment()
         span = adj.get_upper() - adj.get_page_size()
         if span <= 1 or not self.get_mapped():
+            self._tick_id = 0
+            self._t0 = None
             if adj.get_value():
                 adj.set_value(0)
-            self._t0 = None
-            return True
+            return False                    # stop: nothing to scroll
         now = clock.get_frame_time() / 1_000_000
         if self._t0 is None:
             self._t0 = now
@@ -2956,10 +2997,15 @@ class MixerWindow(Adw.ApplicationWindow):
         keys.connect("key-pressed", self.on_key)
         self.add_controller(keys)
 
-        self.guard = VolumeGuard(on_fix=lambda: GLib.idle_add(self.refresh))
+        # A fix by the guard asks for ONE refresh soon. (refresh() returns True to keep its
+        # timer going; handed to idle_add directly it would repeat forever — every fix used to add
+        # another endless loop, up to dozens of refreshes and pactl calls per second.)
+        self._refresh_idle = 0
+        self.guard = VolumeGuard(on_fix=self._refresh_soon)
         self.guard.start()
-        self.connect("close-request", lambda *_: (self.guard.stop(), False)[1])
-        GLib.timeout_add(REFRESH_MS, self.refresh)
+        self.connect("close-request", self._on_close)
+        self._refresh_timer = GLib.timeout_add(REFRESH_MS, self.refresh)
+        self.connect("map", lambda *_: self.refresh())     # shown (again): fill at once
         self.show_system.connect("toggled", self.on_system_toggled)
         self.refresh()
 
@@ -3134,7 +3180,32 @@ class MixerWindow(Adw.ApplicationWindow):
 
     # ── обновление ──────────────────────────────────────────────────────────
 
+    def _refresh_soon(self):
+        if not self._refresh_idle:
+            def once():
+                self._refresh_idle = 0
+                self.refresh()
+                return False
+            self._refresh_idle = GLib.idle_add(once)
+
+    def _on_close(self, *_):
+        """Closing ends everything: the guard, the refresh timer, a pending refresh — and the app."""
+        self.guard.stop()
+        for attr in ("_refresh_timer", "_refresh_idle"):
+            src = getattr(self, attr, 0)
+            if src:
+                GLib.source_remove(src)
+                setattr(self, attr, 0)
+        app = self.get_application()
+        if app is not None:
+            GLib.idle_add(lambda: (app.quit(), False)[1])
+        return False
+
     def refresh(self):
+        if not self._refresh_timer:
+            return False                        # closed: the timer must not outlive the window
+        if not self.get_mapped():
+            return True                         # hidden: nothing to draw, nothing to ask pactl
         self.master.update(master_info())
         apps = collect()
         self.guard.apply(apps)                  # подстраховка к событиям: новые потоки — на запомненную громкость
