@@ -296,6 +296,10 @@ do_install() {
 
     run mkdir -p "$PREFIX/config" "$BIN_DIR" "$APPS_DIR" "$ICON_DIR"
     run install -m 0755 "$SRC_DIR/appmixer" "$PREFIX/appmixer"
+    # дизайн-система Fragile: общий слой GTK, токены тем и их названия
+    for f in gtk_fragile.py fragile-tokens.json fragile-themes.json; do
+        run install -m 0644 "$SRC_DIR/$f" "$PREFIX/$f"
+    done
     # переводы и данные заменяем целиком; config/ с настройками пользователя не трогаем
     run rm -rf "$PREFIX/locales" "$PREFIX/data"
     run cp -a "$SRC_DIR/locales" "$PREFIX/locales"
@@ -390,7 +394,8 @@ do_uninstall() {
             run rm -rf "$PREFIX"
             ok "$(t 'удалено вместе с настройками' 'removed, including settings'): $PREFIX"
         else
-            run rm -rf "$PREFIX/locales" "$PREFIX/data" "$PREFIX/appmixer"
+            run rm -rf "$PREFIX/locales" "$PREFIX/data" "$PREFIX/appmixer" "$PREFIX/gtk_fragile.py" \
+                "$PREFIX/fragile-tokens.json" "$PREFIX/fragile-themes.json" "$PREFIX/__pycache__"
             ok "$(t 'удалено (настройки сохранены в' 'removed (settings kept in') $PREFIX/config)"
         fi
     else

@@ -33,12 +33,13 @@ ones included, and remembers the volume you set until the app starts playing aga
 - **Master volume**, **output-device switcher** (moves playing streams), **hide dead outputs** so the hotkey never
   switches to an unplugged HDMI, and a configurable **hotkey**.
 - Volume above 100 % (up to 300 % per app, 150 % master), highlight for playing apps, mute, mouse wheel.
-- Light and dark themes; 13 languages (system language detected automatically, switch with the *language* button).
+- **Appearance like Fragile Notes:** system / dark / light scheme, 19 built-in themes (Arasaka 荒坂, Sōrai 蒼宙, Matcha…) and your own accent; three interface types — **sharp** (default), **classic** and **glass**; density and monospace labels.
+- 13 languages (system language detected automatically, switch with the *language* button).
 - Keyboard accessible, with accessible names for screen readers.
 
 ## Screenshots
 
-The theme is switched with the sun / moon toggle in the header. Pick which set to view:
+All shots in the dark and the light scheme (sharp type, the default). Other types and themes are under *Appearance*.
 
 <details open>
 <summary><b>Dark theme</b></summary>
@@ -67,6 +68,20 @@ The theme is switched with the sun / moon toggle in the header. Pick which set t
 | 日本語: `Rhythmbox → gst-play-1.0` | Українська: `Kodi → ffplay`, mute, boost |
 
 </details>
+
+## Appearance
+
+The brush button in the header opens the *Appearance* window, built like **Settings → Appearance** in Fragile Notes
+with the same Fragile design system: design type (**sharp**, **classic**, **glass** — shape only, never colour),
+density, reduce transparency (glass), monospace labels (sharp), a gallery of the standard and 19 built-in themes,
+and an accent colour. Any theme works with any type. Colours come only from Fragile Notes tokens.
+
+| | |
+|:--:|:--:|
+| ![Classic](docs/screenshots/styles/classic.png) | ![Glass](docs/screenshots/styles/glass.png) |
+| ![Arasaka](docs/screenshots/styles/arasaka.png) | ![Sōrai](docs/screenshots/styles/sorai.png) |
+| ![Matcha, compact](docs/screenshots/styles/matcha-compact.png) | ![Glass, light](docs/screenshots/styles/glass-light.png) |
+| ![Appearance window](docs/screenshots/styles/appearance.png) | ![Appearance window, glass](docs/screenshots/styles/appearance-glass.png) |
 
 ## Install
 
@@ -137,7 +152,7 @@ to autostart for permanent protection: `./install.sh --autostart` (niri: `spawn-
 
 ## Settings
 
-`config/ui.json` (theme, language, show system apps), `config/outputs.json` (hidden outputs, hotkey),
+`config/ui.json` (appearance: scheme, theme, accent, type, density…; language, show system apps), `config/outputs.json` (hidden outputs, hotkey),
 `config/volumes.json` (remembered volumes). Translations live in `locales/<code>.json`; to add a language put a
 file there and add its code to `LANGUAGES` in `appmixer`.
 

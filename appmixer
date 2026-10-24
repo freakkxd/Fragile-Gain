@@ -155,373 +155,447 @@ MAX_VOLUME = 300          # документированный «потолок 
 VOLUME_STEP = 2
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Оформление (ui-ux-pro-max: Data-Dense Dashboard + тёмная серая палитра).
-#  Токены цвета заданы один раз и используются по имени.
-#    серый   — слайдер и фокус        зелёный — «звучит сейчас»
-#    янтарь  — громкость выше 100 %   красный — мьют
-#  Строки по сетке «плитка · подпись | слайдер | мьют | значение»; приложение и
-#  его вложенные источники склеены в одну карточку со стволом дерева слева.
+#  Оформление: дизайн-система экосистемы Fragile (как в Fragile Notes).
+#  Цвета — только из токенов fragile-tokens.json (база тёмная/светлая + 19 тем
+#  + свой акцент); тип интерфейса (чёткий / классический / стекло) меняет
+#  только форму, отступы и границы. Общий слой — gtk_fragile.py, здесь —
+#  компоненты микшера поверх него.
 # ─────────────────────────────────────────────────────────────────────────────
 
-THEMES = {
-    "dark": {
-        "FG": "white", "NAME_FG": "#f1f5f9", "SURFACE_BG": "#131313",
-        "CARD_BG": "#1e1e1e", "CARD_HOVER": "#272727", "MASTER_BG": "#262626",
-        "CHILD_BG": "#191919", "CHILD_HOVER": "#232323", "POP_BG": "#202020",
-        "ACCENT": "#c8c8c8", "ACCENT_HOVER": "#e6e6e6",
-        "LIVE_COLOR": "#22c55e", "LIVE_TEXT": "#4ade80",
-        "BOOST_COLOR": "#f59e0b", "BOOST_TEXT": "#fbbf24",
-        "MUTED_COLOR": "#ef4444", "MUTE_TEXT": "#fca5a5",
-        "THUMB": "#f8fafc", "TREE_LINE": "rgba(255, 255, 255, 0.28)",
-        "SHADOW": "0.5", "KNOB": "#ededed", "KNOB_ICON": "#1e1e1e",
-    },
-    "light": {
-        "FG": "black", "NAME_FG": "#18181b", "SURFACE_BG": "#c9c9cb",
-        "CARD_BG": "#e4e4e6", "CARD_HOVER": "#d9d9dc", "MASTER_BG": "#ececee",
-        "CHILD_BG": "#d8d8db", "CHILD_HOVER": "#cfcfd2", "POP_BG": "#f3f3f4",
-        "ACCENT": "#52525b", "ACCENT_HOVER": "#27272a",
-        "LIVE_COLOR": "#16a34a", "LIVE_TEXT": "#15803d",
-        "BOOST_COLOR": "#d97706", "BOOST_TEXT": "#b45309",
-        "MUTED_COLOR": "#dc2626", "MUTE_TEXT": "#b91c1c",
-        "THUMB": "#ffffff", "TREE_LINE": "rgba(0, 0, 0, 0.34)",
-        "SHADOW": "0.28", "KNOB": "#27272a", "KNOB_ICON": "#ffffff",
-    },
-}
-DEFAULT_THEME = "dark"
+sys.path.insert(0, str(BASE_DIR))
+import gtk_fragile  # noqa: E402
+
 WINDOW_RADIUS = 9          # как geometry-corner-radius в window-rule niri
 
-# Сколько цветов плиток-заглушек (сами цвета — в CSS, классы tile-0…tile-7)
+DESIGNS = ("sharp", "classic", "glass")
+DENSITIES = ("compact", "regular", "comfortable")
+APPEARANCE_DEFAULTS = {
+    "color_scheme": "system",      # system | dark | light
+    "builtin_theme": "",           # '' или id встроенной темы
+    "accent": "",                  # '' или '#rrggbb' — свой акцент
+    "design": "sharp",
+    "density": "regular",
+    "mono_labels": True,
+    "reduce_transparency": False,
+}
+
+# Сколько оттенков плиток-заглушек (классы tile-0…tile-7, цвета — из токенов)
 TILE_COUNT = 8
 
 
-def build_css(theme):
-    """CSS для выбранной темы: все цвета берутся из словаря THEMES по имени."""
-    t = THEMES.get(theme) or THEMES[DEFAULT_THEME]
-    FG, NAME_FG, SURFACE_BG = t["FG"], t["NAME_FG"], t["SURFACE_BG"]
-    CARD_BG, CARD_HOVER, MASTER_BG = t["CARD_BG"], t["CARD_HOVER"], t["MASTER_BG"]
-    CHILD_BG, CHILD_HOVER, POP_BG = t["CHILD_BG"], t["CHILD_HOVER"], t["POP_BG"]
-    ACCENT, ACCENT_HOVER = t["ACCENT"], t["ACCENT_HOVER"]
-    LIVE_COLOR, LIVE_TEXT = t["LIVE_COLOR"], t["LIVE_TEXT"]
-    BOOST_COLOR, BOOST_TEXT = t["BOOST_COLOR"], t["BOOST_TEXT"]
-    MUTED_COLOR, MUTE_TEXT = t["MUTED_COLOR"], t["MUTE_TEXT"]
-    THUMB, TREE_LINE, SHADOW = t["THUMB"], t["TREE_LINE"], t["SHADOW"]
-    KNOB, KNOB_ICON = t["KNOB"], t["KNOB_ICON"]
+def builtin_themes():
+    """Встроенные темы в порядке Notes: id, имя, кандзи, описание, схема."""
+    try:
+        data = json.loads((BASE_DIR / "fragile-themes.json").read_text(encoding="utf-8"))
+        return [t for t in data.get("themes", []) if t.get("id") in gtk_fragile.TOKENS]
+    except Exception:
+        return [{"id": k, "name": k.title(), "kanji": "", "desc": {}, "scheme": v.get("scheme", "dark")}
+                for k, v in gtk_fragile.TOKENS.items() if k not in ("dark", "light")]
+
+
+def load_appearance():
+    ui = load_ui()
+    a = dict(APPEARANCE_DEFAULTS)
+    if ui.get("theme") in ("dark", "light") and "color_scheme" not in ui:
+        a["color_scheme"] = ui["theme"]                 # настройка старой версии
+    for k in APPEARANCE_DEFAULTS:
+        if k in ui:
+            a[k] = ui[k]
+    if a["color_scheme"] not in ("system", "dark", "light"):
+        a["color_scheme"] = "system"
+    if a["builtin_theme"] not in gtk_fragile.TOKENS or a["builtin_theme"] in ("dark", "light"):
+        a["builtin_theme"] = ""
+    if a["design"] not in DESIGNS:
+        a["design"] = "sharp"
+    if a["density"] not in DENSITIES:
+        a["density"] = "regular"
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(a["accent"] or "")):
+        a["accent"] = ""
+    return a
+
+
+def save_appearance(a):
+    ui = load_ui()
+    ui.pop("theme", None)
+    ui.update({k: a[k] for k in APPEARANCE_DEFAULTS})
+    save_ui(ui)
+
+
+def resolve_scheme(a):
+    """Итоговая схема: у встроенной темы своя, иначе выбранная или системная."""
+    if a["builtin_theme"]:
+        return gtk_fragile.TOKENS[a["builtin_theme"]]["scheme"]
+    if a["color_scheme"] in ("dark", "light"):
+        return a["color_scheme"]
+    try:
+        return "dark" if Adw.StyleManager.get_default().get_dark() else "light"
+    except Exception:
+        return "dark"
+
+
+def theme_tokens(a, scheme):
+    return gtk_fragile.tokens(a["builtin_theme"], scheme, a["accent"])
+
+
+def _token_rgb(t, name):
+    """(r, g, b, a) токена: #rgb, #rrggbb, rgba(), а --color-accent-2 — по формуле Notes."""
+    v = str(t[name]).strip()
+    if name == "--color-accent-2" and v.startswith("hsl"):
+        import colorsys
+        r, g, b, _ = _token_rgb(t, "--interactive-accent")
+        h, l, sat = colorsys.rgb_to_hls(r / 255, g / 255, b / 255)
+        h = (h * 360 - 5) / 360 % 1                       # hsl(h-5, s*1.05, l*1.29)
+        r, g, b = colorsys.hls_to_rgb(h, min(1.0, l * 1.29), min(1.0, sat * 1.05))
+        return round(r * 255), round(g * 255), round(b * 255), 1.0
+    m = re.fullmatch(r"#([0-9a-fA-F]{3})", v)
+    if m:
+        v = "#" + "".join(ch * 2 for ch in m.group(1))
+    return gtk_fragile._rgb(v)
+
+
+def _c(t, name, alpha=1.0):
+    """Цвет токена (при нужде — с прозрачностью)."""
+    r, g, b, a = _token_rgb(t, name)
+    return "rgba(%d,%d,%d,%g)" % (r, g, b, a * alpha)
+
+
+def build_css(a, scheme):
+    """CSS компонентов микшера: цвета из токенов темы, форма из типа интерфейса."""
+    t = theme_tokens(a, scheme)
+    dark = scheme == "dark"
+    design, density = a["design"], a["density"]
+    glass_solid = design == "glass" and a["reduce_transparency"]
+
+    BG, SIDE, ALT = _c(t, "--background-primary"), _c(t, "--background-secondary"), _c(t, "--background-primary-alt")
+    TEXT, MUTED, FAINT = _c(t, "--text-normal"), _c(t, "--text-muted"), _c(t, "--text-faint")
+    BORDER, BORDER_H = _c(t, "--background-modifier-border"), _c(t, "--background-modifier-border-hover")
+    HOVER, ACTIVE = _c(t, "--background-modifier-hover"), _c(t, "--background-modifier-active")
+    ACC, ON_ACC = _c(t, "--interactive-accent"), _c(t, "--text-on-accent")
+    GREEN, ORANGE, RED = _c(t, "--color-green"), _c(t, "--color-orange"), _c(t, "--color-red")
+    # текст состояний: кольцевые токены темнее на светлой схеме — контраст ≥ 4.5:1
+    GREEN_T, ORANGE_T, RED_T = _c(t, "--ring-green"), _c(t, "--ring-amber"), _c(t, "--ring-red")
+    if dark:
+        GREEN_T, ORANGE_T, RED_T = GREEN, ORANGE, RED
+    TRACK = _c(t, "--ring-track")
+    TEXT_A = lambda x: _c(t, "--text-normal", x)       # noqa: E731
+    ACC_A = lambda x: _c(t, "--interactive-accent", x)  # noqa: E731
+
+    header_h = {"compact": 34, "regular": 40, "comfortable": 46}[density]
+    btn_h = {"compact": 24, "regular": 28, "comfortable": 32}[density]
+    row_pad = {"compact": 0, "regular": 3, "comfortable": 7}[density]
+    gap = {"compact": 5, "regular": 8, "comfortable": 11}[density]
+
+    # форма по типу интерфейса
+    if design == "sharp":
+        R_CARD, R_PILL, R_BTN, R_TILE, R_TILE_S, R_TRACK = 0, 0, 0, 0, 0, 0
+    elif design == "classic":
+        R_CARD, R_PILL, R_BTN, R_TILE, R_TILE_S, R_TRACK = 12, 6, 8, 8, 6, 999
+    else:
+        R_CARD, R_PILL, R_BTN, R_TILE, R_TILE_S, R_TRACK = 20, 999, 999, 10, 8, 999
+
+    if design == "glass" and not glass_solid:
+        CARD = _c(t, "--background-primary", 0.58)
+        CARD_H = _c(t, "--background-primary", 0.70)
+        CHILD = _c(t, "--background-primary", 0.42)
+        MASTER = _c(t, "--background-primary", 0.78)
+        POP = _c(t, "--background-primary", 0.90)
+        RIM = "rgba(255,255,255,0.16)" if dark else "rgba(255,255,255,0.7)"
+        RIM_TOP = "rgba(255,255,255,0.34)" if dark else "rgba(255,255,255,0.95)"
+        SHADOW = "0 10px 30px -8px rgba(0,0,0,0.45), 0 2px 6px rgba(0,0,0,0.25)" if dark \
+            else "0 10px 30px -8px rgba(20,30,60,0.22), 0 2px 6px rgba(20,30,60,0.10)"
+        CARD_BORDER = f"1px solid {RIM}"
+        CARD_SHADOW = f"inset 0 1px 0 {RIM_TOP}, {SHADOW}"
+        WIN_BG = (f"radial-gradient(circle at 0% 0%, {ACC_A(0.34)}, transparent 55%), "
+                  f"radial-gradient(circle at 100% 100%, {_c(t, '--color-accent-2', 0.26)}, transparent 55%), "
+                  f"radial-gradient(circle at 100% 0%, {_c(t, '--text-accent', 0.14)}, transparent 45%)")
+        LINE = TEXT_A(0.10)
+    elif design == "glass":                     # уменьшить прозрачность: форма та же, без просвета
+        CARD, CARD_H, CHILD, MASTER, POP = SIDE, HOVER, ALT, ALT, ALT
+        CARD_BORDER, CARD_SHADOW, WIN_BG, LINE = f"1px solid {BORDER}", "none", "none", BORDER
+    else:
+        CARD, CARD_H, CHILD, MASTER, POP = ALT, HOVER, SIDE, SIDE, ALT
+        CARD_BORDER = f"1px solid {BORDER}" if design == "sharp" else "1px solid transparent"
+        CARD_SHADOW = "none" if design == "sharp" else \
+            f"0 1px 2px rgba(0,0,0,{0.28 if dark else 0.03}), 0 4px 10px rgba(0,0,0,{0.18 if dark else 0.05})"
+        WIN_BG, LINE = "none", BORDER
+
+    WIN_SOLID = SIDE if glass_solid else BG
+    POP_SHADOW = ("6px 6px 0 0 rgba(0,0,0,%s)" % (0.32 if dark else 0.1)) if design == "sharp" else \
+        "0 8px 24px rgba(0,0,0,%s)" % (0.4 if dark else 0.15)
+    LIVE_BAR = "2px" if design == "sharp" else "3px"
+    mono = design == "sharp" and a["mono_labels"]
+    MONO = "font-family: 'JetBrains Mono', ui-monospace, monospace;"
+    LABEL = (MONO + " font-size: 10.5px; letter-spacing: 0.08em; font-weight: 600;") if mono else \
+        "font-size: 11px; letter-spacing: 0.09em; font-weight: 800;"
+    VALUE_FONT = MONO if mono else ""
+    THUMB = 14 if design == "sharp" else 16
+    tiles = "\n".join(
+        ".tile-%d {{ background-color: %s; }}" % (i, (TEXT_A(0.14 + 0.04 * (i // 2)) if i % 2 == 0
+                                                       else ACC_A(0.22 + 0.06 * (i // 2))))
+        for i in range(TILE_COUNT)).replace("{{", "{").replace("}}", "}")
+
     return f"""
-/* Фон задаём только самому окну: у него уже есть скругление. Квадратные
-   подложки внутри (toolbarview, шапка) вылезали за скруглённые углы. */
-window.mixer-win {{
-    background-color: {SURFACE_BG};
-}}
-/* niri режет окно по своему радиусу (geometry-corner-radius 9) — делаем такой
-   же и убираем тень и обводку libadwaita, иначе в углах остаётся «ступенька» */
+/* ── акцент libadwaita (переменные) — из темы Fragile, а не системный ──── */
+:root {{ --accent-bg-color: {ACC}; --accent-fg-color: {ON_ACC}; --accent-color: {_c(t, "--text-accent")}; }}
+switch:checked {{ background-color: {ACC}; }}
+switch:checked > slider {{ {"background-color: " + ON_ACC + ";" if design == "sharp" else ""} }}
+switch.theme-switch:checked {{ background-color: {TEXT_A(0.08)}; }}
+
+/* ── окно: фон только у самого окна, подложки внутри прозрачные ─────────── */
+window.mixer-win {{ background-color: {WIN_SOLID}; background-image: {WIN_BG}; color: {TEXT}; }}
 window.mixer-win,
 window.mixer-win.csd,
 window.mixer-win.csd:backdrop {{
-    border-radius: {WINDOW_RADIUS}px;
+    border-radius: {WINDOW_RADIUS}px;            /* niri режет окно по своему радиусу */
     box-shadow: none;
     outline: none;
 }}
-window.mixer-win toolbarview,
-window.mixer-win scrolledwindow,
-window.mixer-win viewport {{
-    background-color: transparent;
-}}
+window.mixer-win toolbarview, window.mixer-win scrolledwindow,
+window.mixer-win viewport, list.mixer-list {{ background-color: transparent; }}
 window.mixer-win headerbar {{
+    min-height: {header_h}px;
     background-color: transparent;
     box-shadow: none;
-    border-bottom: 1px solid alpha({FG}, 0.08);
+    border-bottom: 1px solid {"transparent" if design == "glass" else LINE};
 }}
-/* подписи шапки не должны блёкнуть, когда окно не в фокусе */
-window.mixer-win headerbar,
-window.mixer-win headerbar:backdrop {{ color: {NAME_FG}; }}
-window.mixer-win headerbar > *,
-window.mixer-win headerbar:backdrop > * {{ opacity: 1; }}
+window.mixer-win headerbar, window.mixer-win headerbar:backdrop {{ color: {TEXT}; }}
+window.mixer-win headerbar > windowhandle > box,
+window.mixer-win:backdrop headerbar > windowhandle > box,
+window.mixer-win headerbar > *, window.mixer-win headerbar:backdrop > * {{ opacity: 1; }}
+/* у окна не в фокусе libadwaita приглушает шапку (opacity/filter) — подписи должны читаться */
+headerbar:backdrop, headerbar:backdrop > windowhandle, headerbar:backdrop > windowhandle > box,
+headerbar:backdrop > windowhandle > box > *, headerbar:backdrop windowtitle,
+headerbar:backdrop button, headerbar:backdrop switch, headerbar:backdrop image {{ filter: none; opacity: 1; }}
+toolbarview > .top-bar:backdrop > windowhandle,
+toolbarview > .top-bar headerbar:backdrop > windowhandle {{ filter: none; }}
 window.mixer-win headerbar .title,
-window.mixer-win headerbar:backdrop .title {{ font-weight: 700; color: {NAME_FG}; opacity: 1; }}
+window.mixer-win headerbar:backdrop .title {{ font-weight: 700; color: {TEXT}; opacity: 1; }}
 window.mixer-win headerbar .subtitle,
-window.mixer-win headerbar:backdrop .subtitle {{
-    font-size: 11.5px;
-    color: alpha({FG}, 0.66);
+window.mixer-win headerbar:backdrop .subtitle {{ font-size: 11.5px; color: {MUTED}; opacity: 1; {VALUE_FONT} }}
+window.mixer-win separator {{ background-color: {LINE}; }}
+
+/* ── кнопки шапки: одна высота и одна форма ─────────────────────────────── */
+window.mixer-win headerbar button,
+window.mixer-win headerbar windowcontrols button {{
+    min-height: {btn_h}px;
+    min-width: {btn_h}px;
+    padding: 0;
+    margin: 0;
+    border-radius: {R_BTN}px;
+}}
+window.mixer-win headerbar button.system-toggle,
+window.mixer-win headerbar button.system-toggle:backdrop,
+window.mixer-win headerbar button.appearance-button {{
+    padding: 0 {12 if design != "glass" else 14}px;
+    font-size: 12.5px;
+    font-weight: 600;
+    background-color: {TEXT_A(0.06) if design != "sharp" else "transparent"};
+    box-shadow: inset 0 0 0 1px {BORDER_H};
+    color: {TEXT};
     opacity: 1;
 }}
-window.mixer-win windowcontrols button,
-window.mixer-win windowcontrols:backdrop button {{ color: alpha({FG}, 0.72); opacity: 1; }}
-/* у окна не в фокусе libadwaita приглушает всю шапку — нам это мешает читать подписи */
-window.mixer-win headerbar > windowhandle > box,
-window.mixer-win:backdrop headerbar > windowhandle > box {{ opacity: 1; }}
+window.mixer-win headerbar button.appearance-button {{ padding: 0; min-width: {btn_h}px; }}
+window.mixer-win headerbar button.system-toggle:hover,
+window.mixer-win headerbar button.appearance-button:hover {{ background-color: {HOVER}; }}
+window.mixer-win headerbar button.system-toggle:checked {{
+    background-color: {ACTIVE};
+    box-shadow: {"inset 0 -2px 0 " + ACC + ", inset 0 0 0 1px " + BORDER_H if design == "sharp" else "inset 0 0 0 1px " + ACC_A(0.55)};
+}}
+window.mixer-win headerbar windowcontrols button {{ margin-left: 4px; color: {MUTED}; opacity: 1; }}
+window.mixer-win headerbar windowcontrols button:hover {{ background-color: {HOVER}; color: {TEXT}; }}
+button:focus-visible, switch:focus-visible {{ outline: 2px solid {ACC}; outline-offset: 1px; }}
 
-/* ── карточка: приложение + его источники склеены в одну группу ───────────── */
+/* ── переключатель тёмная/светлая (солнце / луна) ───────────────────────── */
+switch.theme-switch {{
+    min-width: {btn_h * 2 - 2}px;
+    min-height: {btn_h}px;
+    padding: 0;
+    border: none;
+    border-radius: {R_BTN}px;
+    background-image: none;
+    background-color: {TEXT_A(0.08)};
+    box-shadow: inset 0 0 0 1px {BORDER_H};
+}}
+switch.theme-switch:checked {{ background-color: {TEXT_A(0.08)}; }}
+switch.theme-switch > slider {{
+    min-width: {btn_h - 6}px;
+    min-height: {btn_h - 6}px;
+    margin: 3px;
+    border-radius: {R_BTN}px;
+    border: none;
+    background-image: none;
+    background-color: {ACC};
+    box-shadow: {"none" if design == "sharp" else "0 1px 3px rgba(0,0,0,0.35)"};
+}}
+.theme-icon {{ color: {MUTED}; }}
+.theme-icon.on-knob {{ color: {ON_ACC}; }}
+
+/* ── карточка: приложение + его источники склеены в одну группу ─────────── */
 row.mixer-row {{
-    background-color: {CARD_BG};
-    border-radius: 12px;
-    margin: 0 0 8px 0;
-    transition: background-color 150ms ease-out, box-shadow 150ms ease-out;
+    background-color: {CARD};
+    border: {CARD_BORDER};
+    box-shadow: {CARD_SHADOW};
+    border-radius: {R_CARD}px;
+    margin: 0 0 {gap}px 0;
+    padding: {row_pad}px 0;
+    transition: background-color 150ms ease-out;
 }}
-row.mixer-row.g-head {{ border-radius: 12px 12px 0 0; margin-bottom: 0; }}
-row.mixer-row.g-mid  {{ border-radius: 0; margin-bottom: 0; }}
-row.mixer-row.g-tail {{ border-radius: 0 0 12px 12px; }}
-row.mixer-row.child  {{ border-top: 1px solid alpha({FG}, 0.05); }}
-row.mixer-row:hover  {{ background-color: {CARD_HOVER}; }}
-row.mixer-row.live   {{ box-shadow: inset 3px 0 0 {LIVE_COLOR}; }}
-row.mixer-row:focus-within {{ box-shadow: inset 0 0 0 2px alpha({ACCENT_HOVER}, 0.7); }}
-row.mixer-row.live:focus-within {{
-    box-shadow: inset 3px 0 0 {LIVE_COLOR}, inset 0 0 0 2px alpha({ACCENT_HOVER}, 0.7);
-}}
+row.mixer-row.g-head {{ border-radius: {R_CARD}px {R_CARD}px 0 0; margin-bottom: 0; border-bottom-width: 0; }}
+row.mixer-row.g-mid  {{ border-radius: 0; margin-bottom: 0; border-top-width: 0; border-bottom-width: 0; }}
+row.mixer-row.g-tail {{ border-radius: 0 0 {R_CARD}px {R_CARD}px; border-top-width: 0; }}
+row.mixer-row.g-head, row.mixer-row.g-mid {{ box-shadow: none; }}
+row.mixer-row.child {{ background-color: {CHILD}; border-top: 1px solid {LINE}; }}
+row.mixer-row:hover {{ background-color: {CARD_H}; }}
+row.mixer-row.child:hover {{ background-color: {CARD_H}; }}
+row.mixer-row.live {{ box-shadow: inset {LIVE_BAR} 0 0 {GREEN}{", " + CARD_SHADOW if CARD_SHADOW != "none" and design != "sharp" else ""}; }}
+row.mixer-row.g-head.live, row.mixer-row.g-mid.live {{ box-shadow: inset {LIVE_BAR} 0 0 {GREEN}; }}
+row.mixer-row:focus-within {{ outline: none; }}
 
-/* ── плитка приложения (иконка или первая буква) ───────────────────────── */
-.mixer-tile {{
-    min-width: 34px;
-    min-height: 34px;
-    border-radius: 9px;
-    background-color: alpha({FG}, 0.07);
-}}
+/* ── плитка приложения (иконка или первая буква) ────────────────────────── */
+.mixer-tile {{ min-width: 34px; min-height: 34px; border-radius: {R_TILE}px; background-color: {TEXT_A(0.07)}; }}
 .mixer-tile.has-icon {{ background-color: transparent; }}
-.mixer-tile-letter {{
-    font-weight: 800;
-    font-size: 15px;
-    color: #ffffff;
-}}
-.tile-0 {{ background-color: #52525b; }}
-.tile-1 {{ background-color: #6b7280; }}
-.tile-2 {{ background-color: #57534e; }}
-.tile-3 {{ background-color: #4b5563; }}
-.tile-4 {{ background-color: #78716c; }}
-.tile-5 {{ background-color: #5b6470; }}
-.tile-6 {{ background-color: #64645f; }}
-.tile-7 {{ background-color: #6f6a66; }}
+.mixer-tile-letter {{ font-weight: 800; font-size: 15px; color: {TEXT}; }}
+{tiles}
+row.mixer-row.child .mixer-tile {{ min-width: 26px; min-height: 26px; border-radius: {R_TILE_S}px; }}
+row.mixer-row.child .mixer-tile-letter {{ font-size: 12px; }}
 
-/* ── имя, подпись, индикатор «звучит» ──────────────────────────────────── */
-.mixer-name {{ font-weight: 650; font-size: 13.5px; color: {NAME_FG}; }}
-.mixer-sub  {{ font-size: 11.5px; color: alpha({FG}, 0.60); opacity: 1; }}
-.live-dot {{
-    min-width: 7px;
-    min-height: 7px;
-    border-radius: 999px;
-    background-color: {LIVE_COLOR};
-    animation: live-pulse 2200ms ease-in-out infinite;
-}}
-@keyframes live-pulse {{
-    0%   {{ opacity: 1.0; }}
-    50%  {{ opacity: 0.35; }}
-    100% {{ opacity: 1.0; }}
-}}
+/* ── имя, подпись, точка «звучит» (без бесконечной анимации) ────────────── */
+.mixer-name {{ font-weight: 650; font-size: 13.5px; color: {TEXT}; }}
+row.mixer-row.child .mixer-name {{ font-size: 12.5px; font-weight: 600; }}
+.mixer-sub {{ font-size: 11.5px; color: {MUTED}; opacity: 1; }}
+.live-dot {{ min-width: 7px; min-height: 7px; border-radius: 999px; background-color: {GREEN}; }}
 
-/* ── бейдж со значением ────────────────────────────────────────────────── */
+/* ── значение ───────────────────────────────────────────────────────────── */
 .mixer-value {{
     font-size: 12.5px;
     font-weight: 700;
     font-feature-settings: "tnum";
+    {VALUE_FONT}
     padding: 0 9px;
     min-width: 46px;
     min-height: 24px;
-    border-radius: 999px;
-    color: alpha({FG}, 0.82);
-    background-color: alpha({FG}, 0.07);
-    transition: background-color 150ms ease-out, color 150ms ease-out;
+    border-radius: {R_PILL}px;
+    color: {TEXT};
+    background-color: {TEXT_A(0.07)};
+    {"box-shadow: inset 0 0 0 1px " + BORDER + ";" if design == "sharp" else ""}
 }}
-row.mixer-row.live .mixer-value {{
-    background-color: alpha({LIVE_COLOR}, 0.16);
-    color: {LIVE_TEXT};
-}}
-row.mixer-row.boost .mixer-value {{
-    background-color: alpha({BOOST_COLOR}, 0.18);
-    color: {BOOST_TEXT};
-}}
-row.mixer-row.muted .mixer-value {{
-    background-color: alpha({MUTED_COLOR}, 0.18);
-    color: {MUTE_TEXT};
-}}
+row.mixer-row.live .mixer-value {{ background-color: {_c(t, "--color-green", 0.16)}; color: {GREEN_T}; }}
+row.mixer-row.boost .mixer-value, .master-card.boost .mixer-value {{ background-color: {_c(t, "--color-orange", 0.18)}; color: {ORANGE_T}; }}
+row.mixer-row.muted .mixer-value, .master-card.muted .mixer-value {{ background-color: {_c(t, "--color-red", 0.16)}; color: {RED_T}; }}
 
-/* ── кнопка мьюта ──────────────────────────────────────────────────────── */
+/* ── мьют ───────────────────────────────────────────────────────────────── */
 button.mixer-mute {{
-    min-width: 32px;
-    min-height: 32px;
-    padding: 0;
-    border-radius: 999px;
+    min-width: 32px; min-height: 32px; padding: 0;
+    border-radius: {R_PILL if design != "classic" else 999}px;
     background-color: transparent;
-    color: alpha({FG}, 0.62);
-    transition: background-color 150ms ease-out, color 150ms ease-out;
+    color: {MUTED};
 }}
-button.mixer-mute:hover {{
-    background-color: alpha({FG}, 0.09);
-    color: {NAME_FG};
-}}
-button.mixer-mute:checked {{
-    background-color: alpha({MUTED_COLOR}, 0.18);
-    color: {MUTE_TEXT};
-}}
-button.mixer-mute:focus-visible {{ outline: 2px solid alpha({ACCENT_HOVER}, 0.8); outline-offset: 1px; }}
+button.mixer-mute:hover {{ background-color: {HOVER}; color: {TEXT}; }}
+button.mixer-mute:checked {{ background-color: {_c(t, "--color-red", 0.16)}; color: {RED_T}; }}
 
-/* ── слайдер: тонкая дорожка, заливка, круглый бегунок ─────────────────── */
-scale.mixer > trough {{
-    min-height: 6px;
-    border-radius: 999px;
-    background-color: alpha({FG}, 0.10);
-}}
-scale.mixer > trough > highlight {{
-    min-height: 6px;
-    border-radius: 999px;
-    background-color: {ACCENT};
-}}
-scale.mixer.boost > trough > highlight {{ background-color: {BOOST_COLOR}; }}
-scale.mixer.muted > trough > highlight {{ background-color: alpha({FG}, 0.28); }}
+/* ── слайдер: заливка акцентом, буст — оранжевый, мьют — приглушённый ───── */
+scale.mixer > trough {{ min-height: {4 if design == "sharp" else 6}px; border-radius: {R_TRACK}px; background-color: {TRACK}; border: none; }}
+scale.mixer > trough > highlight {{ min-height: {4 if design == "sharp" else 6}px; border-radius: {R_TRACK}px; background-color: {ACC}; }}
+scale.mixer.boost > trough > highlight {{ background-color: {ORANGE}; }}
+scale.mixer.muted > trough > highlight {{ background-color: {FAINT}; }}
 scale.mixer > trough > slider {{
-    min-width: 16px;
-    min-height: 16px;
-    margin: -5px;
-    border: 3px solid {CARD_BG};
-    border-radius: 999px;
-    background-color: {THUMB};
-    box-shadow: 0 1px 4px alpha(black, {SHADOW});
+    transform: none;                         /* Adwaita поворачивает бегунок у шкалы с метками */
+    min-width: {8 if design == "sharp" else THUMB}px; min-height: {18 if design == "sharp" else THUMB}px;
+    margin: {"-7px -4px" if design == "sharp" else "-5px"};
+    border: {"2px solid " + ACC if design == "sharp" else "3px solid " + BG};
+    border-radius: {0 if design == "sharp" else 999}px;
+    background-color: {BG if design == "sharp" else "#ffffff" if design == "glass" else TEXT};
+    box-shadow: {"none" if design == "sharp" else "0 1px 4px rgba(0,0,0,0.4)"};
 }}
-scale.mixer > trough > slider:hover {{ background-color: {THUMB}; }}
-scale.mixer > marks {{ color: alpha({FG}, 0.30); }}
-scale.mixer:focus-visible > trough {{ box-shadow: 0 0 0 2px alpha({ACCENT_HOVER}, 0.7); }}
+scale.mixer.boost > trough > slider {{ {"border-color: " + ORANGE + ";" if design == "sharp" else ""} }}
+scale.mixer > marks {{ color: {FAINT}; }}
+scale.mixer:focus-visible > trough {{ box-shadow: 0 0 0 2px {ACC_A(0.7)}; }}
 
-/* ── дерево: ствол и «отвод» к вложенному источнику ────────────────────── */
-.tree-top {{
-    min-width: 22px;
-    border-left: 2px solid {TREE_LINE};
-    border-bottom: 2px solid {TREE_LINE};
-    border-bottom-left-radius: 9px;
-}}
-.tree-bottom {{
-    min-width: 22px;
-    border-left: 2px solid {TREE_LINE};
-}}
+/* ── дерево: ствол и отвод к вложенному источнику ───────────────────────── */
+.tree-top {{ min-width: 22px; border-left: 2px solid {FAINT}; border-bottom: 2px solid {FAINT};
+            border-bottom-left-radius: {0 if design == "sharp" else 9}px; }}
+.tree-bottom {{ min-width: 22px; border-left: 2px solid {FAINT}; }}
 .tree-bottom.last {{ border-left-color: transparent; }}
-.tree-stub {{
-    min-width: 2px;
-    min-height: 14px;
-    background-color: {TREE_LINE};
-}}
-row.mixer-row.child {{ background-color: {CHILD_BG}; }}
-row.mixer-row.child:hover {{ background-color: {CHILD_HOVER}; }}
-list.mixer-list {{ background-color: transparent; }}
-row.mixer-row.child .mixer-name {{ font-size: 12.5px; font-weight: 600; }}
-row.mixer-row.child .mixer-tile {{
-    min-width: 26px;
-    min-height: 26px;
-    border-radius: 7px;
-}}
-row.mixer-row.child .mixer-tile-letter {{ font-size: 12px; }}
+.tree-stub {{ min-width: 2px; min-height: 14px; background-color: {FAINT}; }}
 
-/* ── выпадающие меню (выход, язык): в светлой теме libadwaita оставляет их тёмными */
-popover.background > contents,
-popover > contents {{
-    background-color: {POP_BG};
-    color: {NAME_FG};
-    border: 1px solid alpha({FG}, 0.12);
-    border-radius: 12px;
-}}
-popover.background > arrow,
-popover > arrow {{
-    background-color: {POP_BG};
-    border: 1px solid alpha({FG}, 0.12);
-}}
-popover button:not(.output-action):not(.flat) {{
-    background-color: alpha({FG}, 0.08);
-    color: {NAME_FG};
-}}
-popover button:not(.output-action):not(.flat):hover {{ background-color: alpha({FG}, 0.14); }}
-popover button.flat {{ color: {NAME_FG}; }}
-popover button.flat:hover {{ background-color: alpha({FG}, 0.10); }}
-popover checkbutton, popover expander title {{ color: {NAME_FG}; }}
-
-/* ── кнопка выбора выхода (подпись под «Общая громкость») ──────────────── */
-button.output-button {{
-    padding: 0 4px 0 0;
-    margin: 0;
-    min-height: 0;
-    min-width: 0;
-    border-radius: 6px;
-    background-color: transparent;
-    box-shadow: none;
-    color: alpha({FG}, 0.60);
-}}
-button.output-button:hover {{ background-color: alpha({FG}, 0.08); color: {NAME_FG}; }}
-button.output-action {{ min-width: 26px; min-height: 26px; padding: 0; border-radius: 999px; }}
-
-/* ── общая громкость выхода ────────────────────────────────────────────── */
+/* ── общая громкость ────────────────────────────────────────────────────── */
 .master-card {{
-    background-color: {MASTER_BG};
-    border: 1px solid alpha({FG}, 0.08);
-    border-radius: 12px;
-    margin-bottom: 14px;
+    background-color: {MASTER};
+    border: {CARD_BORDER if design == "glass" else "1px solid " + BORDER_H};
+    box-shadow: {CARD_SHADOW};
+    border-radius: {R_CARD}px;
+    margin-bottom: {gap + 6}px;
 }}
 .master-card .mixer-name {{ font-size: 14px; }}
-.master-card .master-icon {{ color: alpha({FG}, 0.85); }}
-.master-card.muted .mixer-value {{
-    background-color: alpha({MUTED_COLOR}, 0.18);
-    color: {MUTE_TEXT};
+.master-card .master-icon {{ color: {ACC}; }}
+button.output-button {{
+    padding: 0 4px 0 0; margin: 0; min-height: 0; min-width: 0;
+    border-radius: {min(R_BTN, 6)}px; background-color: transparent; box-shadow: none; color: {MUTED};
 }}
-.master-card.boost .mixer-value {{
-    background-color: alpha({BOOST_COLOR}, 0.18);
-    color: {BOOST_TEXT};
-}}
+button.output-button:hover {{ background-color: {HOVER}; color: {TEXT}; }}
+button.output-action {{ min-width: 26px; min-height: 26px; padding: 0; border-radius: {R_PILL}px; }}
 
-/* ── заголовки разделов и кнопка «служебные» ───────────────────────────── */
-.mixer-section {{
-    font-size: 11px;
-    font-weight: 800;
-    letter-spacing: 0.09em;
-    color: alpha({FG}, 0.60);
-}}
-window.mixer-win separator {{ background-color: alpha({FG}, 0.07); }}
-/* Все кнопки шапки — одна высота (28 px) и одна форма (пилюля) */
-window.mixer-win headerbar button,
-window.mixer-win headerbar windowcontrols button {{
-    min-height: 28px;
-    min-width: 28px;
-    padding: 0;
-    margin: 0;
-    border-radius: 999px;
-}}
-window.mixer-win headerbar button.system-toggle,
-window.mixer-win headerbar button.system-toggle:backdrop {{
-    min-width: 0;
-    padding: 0 14px;
-    font-size: 12.5px;
-    font-weight: 600;
-    background-color: alpha({FG}, 0.08);
-    box-shadow: inset 0 0 0 1px alpha({FG}, 0.10);
-    color: {NAME_FG};
-    opacity: 1;
-}}
-window.mixer-win headerbar button.system-toggle:hover {{ background-color: alpha({FG}, 0.13); }}
-window.mixer-win headerbar button.system-toggle:checked {{
-    background-color: alpha({FG}, 0.22);
-    color: {NAME_FG};
-}}
-window.mixer-win headerbar windowcontrols button {{ margin-left: 4px; }}
+/* ── заголовки разделов ─────────────────────────────────────────────────── */
+.mixer-section {{ {LABEL} color: {FAINT}; }}
 
-/* ── переключатель темы (солнце / луна) ────────────────────────────────── */
-switch.theme-switch {{
-    min-width: 54px;
-    min-height: 28px;
-    padding: 0;
-    border: none;
-    border-radius: 999px;
-    background-image: none;
-    background-color: alpha({FG}, 0.12);
-    box-shadow: inset 0 0 0 1px alpha({FG}, 0.10);
-    outline: none;
-    transition: background-color 180ms ease-out;
+/* ── всплывающие меню ───────────────────────────────────────────────────── */
+popover.background > contents, popover > contents {{
+    background-color: {POP};
+    color: {TEXT};
+    border: 1px solid {BORDER_H if design != "glass" else ("rgba(255,255,255,0.16)" if dark else "rgba(255,255,255,0.7)")};
+    border-radius: {0 if design == "sharp" else 12 if design == "classic" else 16}px;
+    box-shadow: {POP_SHADOW};
 }}
-switch.theme-switch:checked {{ background-color: alpha({FG}, 0.12); }}
-switch.theme-switch:focus-visible {{ box-shadow: 0 0 0 2px alpha({ACCENT_HOVER}, 0.7); }}
-switch.theme-switch > slider {{
-    min-width: 22px;
-    min-height: 22px;
-    margin: 3px;
-    border-radius: 999px;
-    border: none;
-    background-image: none;
-    background-color: {KNOB};
-    box-shadow: 0 1px 3px alpha(black, {SHADOW});
+popover.background > arrow, popover > arrow {{ background-color: {POP}; border: 1px solid {BORDER_H}; }}
+popover button:not(.output-action):not(.flat) {{ background-color: {TEXT_A(0.07)}; color: {TEXT}; border-radius: {R_BTN}px; }}
+popover button:not(.output-action):not(.flat):hover {{ background-color: {HOVER}; }}
+popover button.flat {{ color: {TEXT}; }}
+popover button.flat:hover {{ background-color: {HOVER}; }}
+popover checkbutton, popover expander title {{ color: {TEXT}; }}
+checkbutton check:checked, checkbutton radio:checked {{ background-color: {ACC}; color: {ON_ACC}; }}
+/* радиокнопки и точки остаются круглыми в любом типе (исключение keep-round из Notes) */
+checkbutton radio, radio {{ border-radius: 999px; }}
+
+/* ── окно «Оформление» ──────────────────────────────────────────────────── */
+window.appearance-win {{ background-color: {WIN_SOLID}; background-image: {WIN_BG}; color: {TEXT}; }}
+window.appearance-win headerbar {{ background-color: transparent; box-shadow: none; min-height: {header_h}px;
+    border-bottom: 1px solid {"transparent" if design == "glass" else LINE}; }}
+.appearance-group {{
+    background-color: {CARD};
+    border: {CARD_BORDER if design != "classic" else "1px solid " + BORDER};
+    box-shadow: {CARD_SHADOW};
+    border-radius: {R_CARD}px;
+    padding: 14px 16px;
 }}
-.theme-icon {{ color: alpha({FG}, 0.55); }}
-.theme-icon.on-knob {{ color: {KNOB_ICON}; }}
+.appearance-desc {{ color: {MUTED}; font-size: 12px; }}
+.appearance-title {{ font-weight: 650; font-size: 13.5px; color: {TEXT}; }}
+button.appearance-card {{
+    padding: 6px;
+    border-radius: {R_CARD if design != "glass" else 16}px;
+    background-color: {TEXT_A(0.04)};
+    box-shadow: inset 0 0 0 1px {BORDER};
+    color: {TEXT};
+}}
+button.appearance-card:hover {{ background-color: {HOVER}; }}
+button.appearance-card:checked {{
+    background-color: {ACTIVE if design != "glass" else ACC_A(0.20)};
+    box-shadow: {"inset 0 0 0 1px " + BORDER_H + ", inset 2px 0 0 " + ACC if design == "sharp" else "inset 0 0 0 2px " + ACC};
+}}
+.appearance-card-name {{ font-weight: 650; font-size: 12.5px; }}
+.appearance-card-kanji {{ color: {MUTED}; font-size: 12px; }}
+.appearance-card-desc {{ color: {MUTED}; font-size: 11px; }}
+button.segment {{
+    border-radius: {R_BTN if design != "glass" else 999}px;
+    padding: 0 14px; min-height: {btn_h}px;
+    background-color: transparent;
+    box-shadow: inset 0 0 0 1px {BORDER};
+    color: {TEXT};
+}}
+button.segment:checked {{
+    {"background-color: " + ACTIVE + "; box-shadow: inset 0 -2px 0 " + ACC + ", inset 0 0 0 1px " + BORDER_H + ";" if design == "sharp"
+     else "background-color: " + ACC + "; color: " + ON_ACC + ";"}
+}}
+button.accent-reset {{ border-radius: {R_BTN}px; }}
 """
 
 
@@ -542,29 +616,49 @@ def theme_icon_exists(name):
 
 
 CSS_PROVIDER = None
+_APPEARANCE_LISTENERS = []
 
 
-def apply_theme(name):
-    """Переключает тему: цветовая схема libadwaita и наш CSS."""
+def apply_appearance(window=None):
+    """Применить «Оформление»: схема libadwaita, общий слой Fragile и CSS микшера."""
     global CSS_PROVIDER
     display = Gdk.Display.get_default()
     if display is None:
-        return
-    Adw.StyleManager.get_default().set_color_scheme(
-        Adw.ColorScheme.FORCE_LIGHT if name == "light" else Adw.ColorScheme.FORCE_DARK)
+        return None
+    a = load_appearance()
+    sm = Adw.StyleManager.get_default()
+    if a["builtin_theme"] or a["color_scheme"] != "system":
+        want = gtk_fragile.TOKENS[a["builtin_theme"]]["scheme"] if a["builtin_theme"] else a["color_scheme"]
+        sm.set_color_scheme(Adw.ColorScheme.FORCE_LIGHT if want == "light" else Adw.ColorScheme.FORCE_DARK)
+    else:
+        sm.set_color_scheme(Adw.ColorScheme.DEFAULT)       # «как в системе»
+    scheme = resolve_scheme(a)
+    gtk_fragile.apply(window, theme=a["builtin_theme"], scheme=scheme, design=a["design"],
+                      density=a["density"], mono_labels=a["mono_labels"],
+                      reduce_transparency=a["reduce_transparency"], accent=a["accent"])
     if CSS_PROVIDER is None:
         CSS_PROVIDER = Gtk.CssProvider()
         Gtk.StyleContext.add_provider_for_display(
-            display, CSS_PROVIDER, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-    CSS_PROVIDER.load_from_string(build_css(name))
+            display, CSS_PROVIDER, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 2)
+    CSS_PROVIDER.load_from_string(build_css(a, scheme))
+    for cb in list(_APPEARANCE_LISTENERS):
+        cb(a, scheme)
+    return a
+
+
+def _on_system_dark(sm, _param):
+    a = load_appearance()
+    if not a["builtin_theme"] and a["color_scheme"] == "system":
+        apply_appearance()
 
 
 def install_css():
-    """Подключает наш CSS поверх темы (тема запоминается в ui.json)."""
+    """Подключает оформление и следит за системной схемой (для «как в системе»)."""
     global CSS_INSTALLED
     if CSS_INSTALLED:
         return
-    apply_theme(load_ui().get("theme") or DEFAULT_THEME)
+    apply_appearance()
+    Adw.StyleManager.get_default().connect("notify::dark", _on_system_dark)
     CSS_INSTALLED = True
 
 
@@ -2923,6 +3017,380 @@ class MasterRow(Gtk.Box):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Окно «Оформление» — как раздел Настройки → Оформление в Fragile Notes
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _rgba(t, name, alpha=1.0):
+    r, g, b, a = _token_rgb(t, name)
+    return r / 255, g / 255, b / 255, a * alpha
+
+
+def _rounded(cr, x, y, w, h, r):
+    r = min(r, w / 2, h / 2)
+    if r <= 0:
+        cr.rectangle(x, y, w, h)
+        return
+    import math
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def draw_preview(cr, w, h, t, design):
+    """Мини-окно: фон, боковая панель, строки и акцент — в форме типа интерфейса."""
+    rad = {"sharp": 0, "classic": 5, "glass": 9}[design]
+    cr.set_source_rgba(*_rgba(t, "--background-primary"))
+    _rounded(cr, 0, 0, w, h, 0 if design == "sharp" else 6)
+    cr.fill()
+    if design == "glass":
+        import cairo
+        g = cairo.RadialGradient(0, 0, 0, 0, 0, w * 0.9)
+        g.add_color_stop_rgba(0, *_rgba(t, "--interactive-accent", 0.45))
+        g.add_color_stop_rgba(1, *_rgba(t, "--interactive-accent", 0.0))
+        cr.set_source(g)
+        cr.rectangle(0, 0, w, h)
+        cr.fill()
+    pad = 5 if design == "glass" else 0
+    side_w = w * 0.30
+    cr.set_source_rgba(*_rgba(t, "--background-secondary", 0.62 if design == "glass" else 1))
+    _rounded(cr, pad, pad, side_w - pad, h - 2 * pad, rad)
+    cr.fill()
+    for i in range(3):                                           # строки-«карточки»
+        y = h * 0.16 + i * h * 0.27
+        x0 = side_w + 6
+        cr.set_source_rgba(*_rgba(t, "--background-primary-alt", 0.7 if design == "glass" else 1))
+        _rounded(cr, x0, y, w - x0 - 6, h * 0.2, rad)
+        cr.fill()
+        if design == "sharp" or design == "classic":
+            cr.set_source_rgba(*_rgba(t, "--background-modifier-border"))
+            cr.set_line_width(1)
+            _rounded(cr, x0 + 0.5, y + 0.5, w - x0 - 7, h * 0.2 - 1, rad)
+            cr.stroke()
+        bar_y = y + h * 0.1
+        cr.set_source_rgba(*_rgba(t, "--interactive-accent"))   # «слайдер»
+        _rounded(cr, x0 + 6, bar_y - 1.5, (w - x0 - 18) * (0.35 + 0.2 * i), 3, 0 if design == "sharp" else 1.5)
+        cr.fill()
+    # выделение в боковой панели: полоска / заливка / капля
+    sy = h * 0.2
+    if design == "sharp":
+        cr.set_source_rgba(*_rgba(t, "--background-modifier-active"))
+        cr.rectangle(pad, sy, side_w - pad, h * 0.14)
+        cr.fill()
+        cr.set_source_rgba(*_rgba(t, "--interactive-accent"))
+        cr.rectangle(pad, sy, 2, h * 0.14)
+        cr.fill()
+    else:
+        cr.set_source_rgba(*_rgba(t, "--interactive-accent", 0.35 if design == "glass" else 0.28))
+        _rounded(cr, pad + 3, sy, side_w - pad - 6, h * 0.14, rad)
+        cr.fill()
+
+
+class AppearanceWindow(Adw.Window):
+    """Оформление: тип дизайна, плотность, прозрачность, моно-подписи, тема и акцент."""
+
+    def __init__(self, parent):
+        super().__init__(transient_for=parent, modal=True, title=tr("Оформление"),
+                         application=parent.get_application())
+        self.add_css_class("appearance-win")
+        self.set_default_size(720, 760)
+        self.parent_win = parent
+        self.busy = False
+        self.a = load_appearance()
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title=tr("Оформление"), subtitle=APP_TITLE))
+        toolbar.add_top_bar(header)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        for setter in ("set_margin_top", "set_margin_bottom", "set_margin_start", "set_margin_end"):
+            getattr(body, setter)(14)
+        scroller.set_child(body)
+        toolbar.set_content(scroller)
+        self.set_content(toolbar)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", lambda c, kv, kc, st: (self.close(), True)[1] if kv == Gdk.KEY_Escape else False)
+        self.add_controller(keys)
+
+        # ── Вид ─────────────────────────────────────────────────────────────
+        body.append(self._label(tr("Вид")))
+        g = self._group()
+        body.append(g)
+        g.append(self._row_title(tr("Тип дизайна"),
+                                 tr("Компоновка и форма интерфейса. Цветовая тема и акцент работают с любым типом.")))
+        types = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, homogeneous=True)
+        self.design_btns = {}
+        group = None
+        for d, name, desc in (("sharp", tr("Чёткий"), tr("Основной: прямые углы, ясные границы блоков, плотная сетка")),
+                              ("classic", tr("Классический"), tr("Мягкие скругления и плавающие панели, как раньше")),
+                              ("glass", tr("Стекло"), tr("Как в новой iOS: полупрозрачные панели"))):
+            btn = self._card(lambda area, cr, w, h, d=d: draw_preview(cr, w, h, self._tokens(), d),
+                             name, "", desc, 150, 80)
+            group = self._radio(btn, group)
+            btn.connect("toggled", self._on_design, d)
+            self.design_btns[d] = btn
+            types.append(btn)
+        g.append(types)
+
+        g.append(self._sep())
+        dens_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        dens_row.append(self._row_title(tr("Плотность"), tr("Высота строк, вкладок и заголовков панелей."), expand=True))
+        seg = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        seg.set_valign(Gtk.Align.CENTER)
+        self.density_btns, group = {}, None
+        for d, name in (("compact", tr("Компактная")), ("regular", tr("Обычная")), ("comfortable", tr("Просторная"))):
+            b = Gtk.ToggleButton(label=name)
+            b.add_css_class("segment")
+            group = self._radio(b, group)
+            b.connect("toggled", self._on_density, d)
+            self.density_btns[d] = b
+            seg.append(b)
+        dens_row.append(seg)
+        g.append(dens_row)
+
+        self.transp_sep = self._sep()
+        g.append(self.transp_sep)
+        self.transp_row, self.transp_sw = self._switch_row(
+            tr("Уменьшить прозрачность"),
+            tr("Панели станут непрозрачными: проще читать и легче для слабых компьютеров."),
+            "reduce_transparency")
+        g.append(self.transp_row)
+        self.mono_sep = self._sep()
+        g.append(self.mono_sep)
+        self.mono_row, self.mono_sw = self._switch_row(
+            tr("Моноширинные подписи"),
+            tr("Заголовки разделов, сводка и значения — моноширинным шрифтом заглавными."),
+            "mono_labels")
+        g.append(self.mono_row)
+
+        # ── Цвета ───────────────────────────────────────────────────────────
+        body.append(self._label(tr("Цвета")))
+        g = self._group()
+        body.append(g)
+        g.append(self._row_title(tr("Встроенная тема оформления"), ""))
+        self.theme_desc = Gtk.Label(xalign=0, wrap=True)
+        self.theme_desc.add_css_class("appearance-desc")
+        g.append(self.theme_desc)
+        flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
+                           max_children_per_line=4, min_children_per_line=2,
+                           row_spacing=8, column_spacing=8)
+        self.theme_btns, group = {}, None
+        std = (("std:dark", tr("Тёмная"), "dark"), ("std:light", tr("Светлая"), "light"),
+               ("std:system", tr("Системная"), None))
+        for key, name, sch in std:
+            btn = self._card(lambda area, cr, w, h, sch=sch: self._draw_theme(cr, w, h, "", sch),
+                             name, "", tr("Стандартная тема"), 140, 64)
+            group = self._radio(btn, group)
+            btn.connect("toggled", self._on_theme, key)
+            self.theme_btns[key] = btn
+            flow.append(btn)
+        lang = "ru" if _I18N["code"] in ("ru", "uk") else "en"
+        self.theme_info = {}
+        for th in builtin_themes():
+            desc = (th.get("desc") or {}).get(lang) or (th.get("desc") or {}).get("en", "")
+            self.theme_info[th["id"]] = (th.get("name", th["id"]), th.get("kanji", ""), desc)
+            btn = self._card(lambda area, cr, w, h, tid=th["id"]: self._draw_theme(cr, w, h, tid, None),
+                             th.get("name", th["id"]), th.get("kanji", ""), desc, 140, 64)
+            group = self._radio(btn, group)
+            btn.connect("toggled", self._on_theme, th["id"])
+            self.theme_btns[th["id"]] = btn
+            flow.append(btn)
+        g.append(flow)
+        self.scheme_hint = Gtk.Label(label=tr("Задаётся выбранной темой. Смена схемы вернёт стандартную тему."),
+                                     xalign=0, wrap=True)
+        self.scheme_hint.add_css_class("appearance-desc")
+        g.append(self.scheme_hint)
+
+        g.append(self._sep())
+        acc_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        acc_row.append(self._row_title(tr("Цвет акцента"), tr("Цвет ссылок, кнопок и выделений."), expand=True))
+        self.accent_btn = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=False))
+        self.accent_btn.set_valign(Gtk.Align.CENTER)
+        self.accent_btn.connect("notify::rgba", self._on_accent)
+        acc_row.append(self.accent_btn)
+        self.accent_reset = Gtk.Button(label=tr("Сбросить"))
+        self.accent_reset.add_css_class("accent-reset")
+        self.accent_reset.set_valign(Gtk.Align.CENTER)
+        self.accent_reset.connect("clicked", self._on_accent_reset)
+        acc_row.append(self.accent_reset)
+        g.append(acc_row)
+
+        self.areas = []
+        self._sync()
+        _APPEARANCE_LISTENERS.append(self._on_applied)
+        self.connect("close-request", lambda *_: (_APPEARANCE_LISTENERS.remove(self._on_applied)
+                                                  if self._on_applied in _APPEARANCE_LISTENERS else None, False)[1])
+
+    # ── строительные блоки ──────────────────────────────────────────────────
+    def _label(self, text):
+        lbl = Gtk.Label(label=text.upper(), xalign=0)
+        lbl.add_css_class("mixer-section")
+        lbl.set_margin_start(4)
+        lbl.set_margin_top(4)
+        return lbl
+
+    def _group(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.add_css_class("appearance-group")
+        return box
+
+    def _sep(self):
+        return Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+
+    def _row_title(self, title, desc, expand=False):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_hexpand(expand)
+        t = Gtk.Label(label=title, xalign=0)
+        t.add_css_class("appearance-title")
+        box.append(t)
+        if desc:
+            d = Gtk.Label(label=desc, xalign=0, wrap=True)
+            d.add_css_class("appearance-desc")
+            box.append(d)
+        return box
+
+    def _switch_row(self, title, desc, key):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        row.append(self._row_title(title, desc, expand=True))
+        sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+        sw.update_property([Gtk.AccessibleProperty.LABEL], [title])
+        sw.connect("notify::active", lambda s, _p: self._set(key, s.get_active()))
+        row.append(sw)
+        return row, sw
+
+    def _radio(self, btn, group):
+        if group is not None:
+            btn.set_group(group)
+        return group or btn
+
+    def _card(self, draw, name, kanji, desc, w, h):
+        btn = Gtk.ToggleButton()
+        btn.add_css_class("appearance-card")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        area = Gtk.DrawingArea(content_width=w, content_height=h)
+        area.set_draw_func(draw)
+        area.set_hexpand(True)
+        box.append(area)
+        self.areas = getattr(self, "areas", [])
+        self.areas.append(area)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        n = Gtk.Label(label=name, xalign=0)
+        n.add_css_class("appearance-card-name")
+        head.append(n)
+        if kanji:
+            k = Gtk.Label(label=kanji, xalign=0)
+            k.add_css_class("appearance-card-kanji")
+            head.append(k)
+        box.append(head)
+        if desc:
+            d = Gtk.Label(label=desc, xalign=0, wrap=True, lines=2, ellipsize=3)
+            d.set_max_width_chars(22)
+            d.add_css_class("appearance-card-desc")
+            box.append(d)
+        btn.set_child(box)
+        btn.set_tooltip_text(desc or name)
+        btn.update_property([Gtk.AccessibleProperty.LABEL], [("%s %s" % (name, kanji)).strip()])
+        return btn
+
+    def _tokens(self):
+        return theme_tokens(self.a, resolve_scheme(self.a))
+
+    def _draw_theme(self, cr, w, h, tid, scheme):
+        if tid:
+            t = gtk_fragile.tokens(tid, gtk_fragile.TOKENS[tid]["scheme"], self.a["accent"])
+        elif scheme:
+            t = gtk_fragile.tokens("", scheme, self.a["accent"])
+        else:                                   # «системная»: половина тёмной, половина светлой
+            draw_preview(cr, w, h, gtk_fragile.tokens("", "dark", self.a["accent"]), self.a["design"])
+            cr.save()
+            cr.move_to(w * 0.62, 0)
+            cr.line_to(w, 0)
+            cr.line_to(w, h)
+            cr.line_to(w * 0.38, h)
+            cr.close_path()
+            cr.clip()
+            draw_preview(cr, w, h, gtk_fragile.tokens("", "light", self.a["accent"]), self.a["design"])
+            cr.restore()
+            return
+        draw_preview(cr, w, h, t, self.a["design"])
+
+    # ── состояние ───────────────────────────────────────────────────────────
+    def _sync(self):
+        self.busy = True
+        try:
+            a = self.a
+            self.design_btns[a["design"]].set_active(True)
+            self.density_btns[a["density"]].set_active(True)
+            self.transp_sw.set_active(bool(a["reduce_transparency"]))
+            self.mono_sw.set_active(bool(a["mono_labels"]))
+            glass, sharp = a["design"] == "glass", a["design"] == "sharp"
+            for w in (self.transp_sep, self.transp_row):
+                w.set_visible(glass)
+            for w in (self.mono_sep, self.mono_row):
+                w.set_visible(sharp)
+            key = a["builtin_theme"] or "std:%s" % a["color_scheme"]
+            self.theme_btns.get(key, self.theme_btns["std:system"]).set_active(True)
+            if a["builtin_theme"]:
+                name, kanji, desc = self.theme_info.get(a["builtin_theme"], (a["builtin_theme"], "", ""))
+                self.theme_desc.set_text("%s %s — %s" % (name, kanji, desc) if desc else name)
+            else:
+                self.theme_desc.set_text(tr("Стандартная тема"))
+            self.scheme_hint.set_visible(bool(a["builtin_theme"]))
+            rgba = Gdk.RGBA()
+            rgba.parse(a["accent"] or self._tokens()["--interactive-accent"])
+            self.accent_btn.set_rgba(rgba)
+            self.accent_reset.set_visible(bool(a["accent"]))
+        finally:
+            self.busy = False
+        for area in self.areas:
+            area.queue_draw()
+
+    def _set(self, key, value):
+        if self.busy:
+            return
+        self.a[key] = value
+        save_appearance(self.a)
+        apply_appearance(self.parent_win)
+
+    def _on_applied(self, a, scheme):
+        self.a = dict(a)
+        self._sync()
+
+    def _on_design(self, btn, d):
+        if btn.get_active():
+            self._set("design", d)
+
+    def _on_density(self, btn, d):
+        if btn.get_active():
+            self._set("density", d)
+
+    def _on_theme(self, btn, key):
+        if not btn.get_active() or self.busy:
+            return
+        if key.startswith("std:"):
+            self.a["builtin_theme"] = ""
+            self.a["color_scheme"] = key[4:]
+        else:
+            self.a["builtin_theme"] = key
+        save_appearance(self.a)
+        apply_appearance(self.parent_win)
+
+    def _on_accent(self, btn, _param):
+        if self.busy:
+            return
+        c = btn.get_rgba()
+        self._set("accent", "#%02x%02x%02x" % (round(c.red * 255), round(c.green * 255), round(c.blue * 255)))
+
+    def _on_accent_reset(self, _btn):
+        self._set("accent", "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Окно
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2930,6 +3398,7 @@ class MixerWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title=APP_TITLE)
         self.add_css_class("mixer-win")
+        _APPEARANCE_LISTENERS.append(lambda a, scheme: self.on_appearance_applied(a, scheme))
         self.set_default_size(880, -1)      # высоту подбирает GTK по содержимому
         self.rows = {}
         self.pending = {}
@@ -2951,6 +3420,15 @@ class MixerWindow(Adw.ApplicationWindow):
         header.pack_start(self.show_system)
         header.pack_start(self._make_lang_button())
         header.pack_end(self._make_theme_switch())
+        self.appearance_btn = Gtk.Button.new_from_icon_name(
+            "preferences-desktop-appearance-symbolic"
+            if theme_icon_exists("preferences-desktop-appearance-symbolic") else "applications-graphics-symbolic")
+        self.appearance_btn.add_css_class("appearance-button")
+        self.appearance_btn.set_valign(Gtk.Align.CENTER)
+        self.appearance_btn.set_tooltip_text(tr("Оформление"))
+        self.appearance_btn.update_property([Gtk.AccessibleProperty.LABEL], [tr("Оформление")])
+        self.appearance_btn.connect("clicked", lambda *_: AppearanceWindow(self).present())
+        header.pack_end(self.appearance_btn)
         toolbar.add_top_bar(header)
         self._header = header
         GLib.idle_add(self._center_header_buttons)
@@ -3015,8 +3493,8 @@ class MixerWindow(Adw.ApplicationWindow):
         self.theme_switch = Gtk.Switch()
         self.theme_switch.add_css_class("theme-switch")
         self.theme_switch.set_valign(Gtk.Align.CENTER)
-        dark = (load_ui().get("theme") or DEFAULT_THEME) != "light"
-        self.theme_switch.set_active(dark)
+        self._switch_sync = False
+        self.theme_switch.set_active(resolve_scheme(load_appearance()) == "dark")
         self.theme_switch.set_tooltip_text(tr("Тема: тёмная / светлая"))
         try:
             self.theme_switch.update_property([Gtk.AccessibleProperty.LABEL],
@@ -3096,7 +3574,9 @@ class MixerWindow(Adw.ApplicationWindow):
             tr("Показать служебные приложения (WirePlumber, порталы и т.п.).\n"
                "Они появятся ниже разделительной полосы."))
         self.theme_switch.set_tooltip_text(tr("Тема: тёмная / светлая"))
+        self.appearance_btn.set_tooltip_text(tr("Оформление"))
         try:
+            self.appearance_btn.update_property([Gtk.AccessibleProperty.LABEL], [tr("Оформление")])
             self.theme_switch.update_property([Gtk.AccessibleProperty.LABEL], [tr("Тёмная тема")])
         except Exception:
             pass
@@ -3126,12 +3606,22 @@ class MixerWindow(Adw.ApplicationWindow):
                 icon.remove_css_class("on-knob")
 
     def on_theme_toggled(self, switch, _param):
-        name = "dark" if switch.get_active() else "light"
-        apply_theme(name)
-        ui = load_ui()
-        ui["theme"] = name
-        save_ui(ui)
         self._theme_icons()
+        if self._switch_sync:
+            return
+        a = load_appearance()
+        a["color_scheme"] = "dark" if switch.get_active() else "light"
+        a["builtin_theme"] = ""                    # смена схемы возвращает стандартную тему
+        save_appearance(a)
+        apply_appearance(self)
+
+    def on_appearance_applied(self, a, scheme):
+        """Оформление поменялось (окно «Оформление», система): синхронизировать шапку."""
+        self._switch_sync = True
+        try:
+            self.theme_switch.set_active(scheme == "dark")
+        finally:
+            self._switch_sync = False
 
     def on_key(self, controller, keyval, keycode, state):
         if self.master.recording:
@@ -3440,7 +3930,10 @@ def main():
 
     def on_activate(a):
         install_css()
-        win = a.get_active_window() or MixerWindow(a)
+        win = a.get_active_window()
+        if win is None:
+            win = MixerWindow(a)
+            apply_appearance(win)                # класс design-<тип> на окне
         win.present()
 
     app.connect("activate", on_activate)

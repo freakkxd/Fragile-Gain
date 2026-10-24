@@ -164,6 +164,118 @@
   {
    "key": "Переключение работает только пока программа запущена. Рекомендуем добавить её в автозапуск.",
    "note": "One short note shown under the hotkey setting: 'Switching works only while the program is running. We recommend adding it to autostart.' Two short sentences; natural phrase for 'autostart' (startup applications)."
+  },
+  {
+   "key": "Оформление",
+   "note": "Window title and header button tooltip: 'Appearance' settings."
+  },
+  {
+   "key": "Вид",
+   "note": "Settings group header: 'Look' (layout)."
+  },
+  {
+   "key": "Цвета",
+   "note": "Settings group header: 'Colors'."
+  },
+  {
+   "key": "Тип дизайна",
+   "note": "Setting: 'Design type'."
+  },
+  {
+   "key": "Компоновка и форма интерфейса. Цветовая тема и акцент работают с любым типом.",
+   "note": "Description of design type."
+  },
+  {
+   "key": "Чёткий",
+   "note": "Design type name: 'Sharp'."
+  },
+  {
+   "key": "Основной: прямые углы, ясные границы блоков, плотная сетка",
+   "note": "Description of Sharp type."
+  },
+  {
+   "key": "Классический",
+   "note": "Design type name: 'Classic'."
+  },
+  {
+   "key": "Мягкие скругления и плавающие панели, как раньше",
+   "note": "Description of Classic type."
+  },
+  {
+   "key": "Стекло",
+   "note": "Design type name: 'Glass'."
+  },
+  {
+   "key": "Как в новой iOS: полупрозрачные панели",
+   "note": "Description of Glass type."
+  },
+  {
+   "key": "Плотность",
+   "note": "Setting: 'Density'."
+  },
+  {
+   "key": "Высота строк, вкладок и заголовков панелей.",
+   "note": "Description of density."
+  },
+  {
+   "key": "Компактная",
+   "note": "Density: compact."
+  },
+  {
+   "key": "Обычная",
+   "note": "Density: regular."
+  },
+  {
+   "key": "Просторная",
+   "note": "Density: comfortable."
+  },
+  {
+   "key": "Уменьшить прозрачность",
+   "note": "Setting: 'Reduce transparency'."
+  },
+  {
+   "key": "Панели станут непрозрачными: проще читать и легче для слабых компьютеров.",
+   "note": "Description."
+  },
+  {
+   "key": "Моноширинные подписи",
+   "note": "Setting: 'Monospace labels'."
+  },
+  {
+   "key": "Заголовки разделов, сводка и значения — моноширинным шрифтом заглавными.",
+   "note": "Description."
+  },
+  {
+   "key": "Встроенная тема оформления",
+   "note": "Setting: 'Built-in theme'."
+  },
+  {
+   "key": "Тёмная",
+   "note": "Theme card: 'Dark'."
+  },
+  {
+   "key": "Светлая",
+   "note": "Theme card: 'Light'."
+  },
+  {
+   "key": "Системная",
+   "note": "Theme card: 'System'."
+  },
+  {
+   "key": "Стандартная тема",
+   "note": "Caption: 'Standard theme'."
+  },
+  {
+   "key": "Задаётся выбранной темой. Смена схемы вернёт стандартную тему.",
+   "note": "Hint when a built-in theme is chosen."
+  },
+  {
+   "key": "Цвет акцента",
+   "note": "Setting: 'Accent color'."
+  },
+  {
+   "key": "Цвет ссылок, кнопок и выделений.",
+   "note": "Description of accent."
   }
  ]
 }

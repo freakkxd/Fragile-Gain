@@ -8,7 +8,8 @@
 Использование:
   python3 docs/make_screenshots.py                      # все сценарии в обеих темах → docs/screenshots/{light,dark}/*.png
   python3 docs/make_screenshots.py overview             # один сценарий
-  python3 docs/make_screenshots.py --theme=dark         # только тёмная тема
+  python3 docs/make_screenshots.py --theme=dark         # только тёмная тема (без стилей)
+  python3 docs/make_screenshots.py glass arasaka        # отдельные кадры типов/тем → docs/screenshots/styles/
 Нужны PyGObject, GTK 4, libadwaita и Pillow.
 """
 import importlib.machinery
@@ -109,6 +110,20 @@ SCENARIOS = {
         ]),
 }
 
+# Типы интерфейса и темы Fragile: кадр снимается один раз (в docs/screenshots/styles/).
+# window="appearance" — снимок окна «Оформление» поверх микшера.
+STYLES = {
+    "classic": dict(scenario="overview", appearance={"color_scheme": "dark", "design": "classic"}),
+    "glass": dict(scenario="overview", appearance={"color_scheme": "dark", "design": "glass"}),
+    "glass-light": dict(scenario="english", appearance={"color_scheme": "light", "design": "glass"}),
+    "arasaka": dict(scenario="overview", appearance={"builtin_theme": "arasaka"}),
+    "sorai": dict(scenario="english", appearance={"builtin_theme": "sorai", "design": "classic"}),
+    "matcha-compact": dict(scenario="ukrainian", appearance={"builtin_theme": "matcha", "density": "compact"}),
+    "appearance": dict(scenario="overview", appearance={"color_scheme": "dark"}, window="appearance"),
+    "appearance-glass": dict(scenario="overview", appearance={"builtin_theme": "denno", "design": "glass"},
+                             window="appearance"),
+}
+
 OUTPUTS = [  # (имя, подпись, «мёртвый», скрыт)
     ("builtin", "Built-in Audio Analog Stereo", False, False),
     ("minifuse", "MiniFuse 2 Main Output L/R", False, False),
@@ -128,14 +143,23 @@ def load_module():
 
 def run_scenario(name, theme):
     """Один сценарий в одной теме (отдельный процесс): отрисовать окно, сохранить PNG."""
-    sc = dict(SCENARIOS[name], theme=theme)
+    style = STYLES.get(theme[len("style:"):]) if theme.startswith("style:") else None
+    if style:
+        sc = dict(SCENARIOS[style["scenario"]], theme=theme, appearance=style["appearance"],
+                  window=style.get("window"))
+        out_dir, out_name = OUT / "styles", theme[len("style:"):]
+    else:
+        sc = dict(SCENARIOS[name], theme=theme, appearance={"color_scheme": theme}, window=None)
+        out_dir, out_name = OUT / theme, name
     m = load_module()
     from gi.repository import Adw, GLib, Gdk, Graphene, Gtk
 
     tmp = Path(tempfile.mkdtemp())
     m.UI_FILE = tmp / "ui.json"
     m.OUTPUTS_FILE = tmp / "outputs.json"
-    m.UI_FILE.write_text(json.dumps({"show_system": True, "theme": sc["theme"], "lang": sc["lang"]}))
+    ui = {"show_system": True, "lang": sc["lang"]}
+    ui.update(sc["appearance"])
+    m.UI_FILE.write_text(json.dumps(ui))
     m.OUTPUTS_FILE.write_text(json.dumps(
         {"hidden": [o[0] for o in OUTPUTS if o[3]], "hotkey": "<Control>XF86AudioMute"}))
     m.set_language(sc["lang"])
@@ -224,7 +248,7 @@ def run_scenario(name, theme):
         ImageDraw.Draw(mask).rounded_rectangle((0, 0, shot.width - 1, shot.height - 1), radius, fill=255)
         shot.putalpha(ImageChops.multiply(shot.getchannel("A"), mask))
 
-        if sc["menu"]:
+        if sc["menu"] and not sc["window"]:
             pop = win.master.out_pop if sc["menu"] == "outputs" else win.lang_popover
             anchor = win.master.out_button if sc["menu"] == "outputs" else win.lang_button
             if pop.get_width() < 10:
@@ -247,21 +271,28 @@ def run_scenario(name, theme):
             (pad, pad + 10 * SCALE, pad + shot.width, pad + shot.height + 10 * SCALE), radius, fill=(0, 0, 0, 150))
         canvas.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(16 * SCALE)))
         canvas.alpha_composite(shot, (pad, pad))
-        target = OUT / theme
-        target.mkdir(parents=True, exist_ok=True)
-        canvas.save(target / ("%s.png" % name), optimize=True)
-        print("saved", target / ("%s.png" % name))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        canvas.save(out_dir / ("%s.png" % out_name), optimize=True)
+        print("saved", out_dir / ("%s.png" % out_name))
         app_.quit()
         return False
 
     def activate(a):
         m.install_css()
         win = m.MixerWindow(a)
+        m.apply_appearance(win)
         win.set_default_size(880, 10)
         win.present()
 
         def step():
             win.refresh()
+            win._fit_height()                          # высота окна строго по содержимому
+            if sc["window"] == "appearance":
+                aw = m.AppearanceWindow(win)
+                aw.set_default_size(720, 1180)
+                aw.present()
+                GLib.timeout_add(1200, lambda: finish(aw))
+                return False
             if sc["menu"] == "outputs":
                 win.master.out_pop.set_autohide(False)     # окно может быть не в фокусе
                 win.master.out_button.popup()
@@ -280,12 +311,16 @@ def run_scenario(name, theme):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     themes = [a[len("--theme="):] for a in sys.argv[1:] if a.startswith("--theme=")] or ["light", "dark"]
-    names = args or list(SCENARIOS)
+    styles_only = [a for a in args if a in STYLES]
+    names = [a for a in args if a not in STYLES] or ([] if styles_only else list(SCENARIOS))
     for n in names:
         if n not in SCENARIOS:
-            sys.exit("неизвестный сценарий: %s (есть: %s)" % (n, ", ".join(SCENARIOS)))
+            sys.exit("неизвестный сценарий: %s (есть: %s; стили: %s)" % (n, ", ".join(SCENARIOS), ", ".join(STYLES)))
         for th in themes:
             subprocess.run([sys.executable, __file__, n, th, "--inner"], check=False)
+    if "--theme=" not in " ".join(sys.argv) and (styles_only or not args):
+        for key in styles_only or list(STYLES):          # типы интерфейса и встроенные темы
+            subprocess.run([sys.executable, __file__, STYLES[key]["scenario"], "style:" + key, "--inner"], check=False)
 
 
 if __name__ == "__main__":
