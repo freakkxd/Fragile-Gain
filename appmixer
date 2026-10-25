@@ -1380,9 +1380,103 @@ def state_text(row):
     return title or tr("играет")
 
 
+LEVEL_CLIENT = "appmixer-level"       # имя наших измерителей уровня в аудиосервере
+LEVELS = None                         # LevelMonitor окна; без окна (CLI) — только флаг паузы
+
+
 def streams_active(streams):
-    """Есть ли поток, который реально играет (не на паузе)."""
+    """Звучит ли что-то на самом деле.
+
+    Флага «на паузе» (corked) мало: Chromium/Electron-приложения (Fragile Signal,
+    Discord, …) на паузе держат поток открытым и шлют в него тишину. Поэтому, когда
+    работает измеритель уровня, «звучит» = в потоке был сигнал за последние секунды.
+    """
+    if LEVELS is not None:
+        return any(not si.get("corked") and LEVELS.sounding(si.get("index")) for si in streams)
     return any(not si.get("corked") for si in streams)
+
+
+class LevelMonitor:
+    """Пиковый уровень каждого потока через его монитор (parec --monitor-stream).
+
+    На поток — один лёгкий parec (8 кГц, моно), он умирает вместе с микшером. Поток
+    считается звучащим, если за последние HOLD секунд пик был выше порога; пока
+    измеритель только запущен и данных нет, верим флагу паузы.
+    """
+
+    HOLD = 2.0            # сколько секунд держать «звучит» после последнего звука
+    WARMUP = 0.8          # сколько ждать первых данных, прежде чем верить тишине
+    THRESHOLD = 24        # пик s16 (~ −63 dB): ниже — это тишина/шум округления
+
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self.mon = {}       # index -> {"proc", "start", "last"}
+
+    def sounding(self, idx):
+        with self._lock:
+            m = self.mon.get(idx)
+            if m is None:
+                return True
+            now = time.monotonic()
+            if m["last"] and now - m["last"] < self.HOLD:
+                return True
+            return now - m["start"] < self.WARMUP
+
+    def sync(self, streams):
+        """Запустить измерители для новых незаглушённых потоков, убрать исчезнувшие."""
+        want = {si.get("index") for si in streams
+                if not si.get("corked") and not str((si.get("properties") or {}).get(PHANTOM_MARK)).lower() in ("true", "1")}
+        with self._lock:
+            gone = [i for i in self.mon if i not in want]
+        for idx in gone:
+            self._stop(idx)
+        for idx in want - set(self.mon):
+            self._start(idx)
+
+    def _start(self, idx):
+        import threading
+        try:
+            proc = subprocess.Popen(
+                ["parec", "--monitor-stream=%d" % idx, "--raw", "--format=s16le", "--rate=8000",
+                 "--channels=1", "--latency-msec=100", "--client-name=" + LEVEL_CLIENT],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                preexec_fn=_die_with_parent)
+        except Exception:
+            return
+        m = {"proc": proc, "start": time.monotonic(), "last": 0.0}
+        with self._lock:
+            self.mon[idx] = m
+        threading.Thread(target=self._reader, args=(m,), daemon=True).start()
+
+    def _reader(self, m):
+        import array
+        out = m["proc"].stdout
+        while True:
+            chunk = out.read(800)                       # ~50 мс звука
+            if not chunk:
+                return
+            a = array.array("h", chunk[:len(chunk) // 2 * 2])
+            if a and max(max(a), -min(a)) > self.THRESHOLD:
+                m["last"] = time.monotonic()
+
+    def _stop(self, idx):
+        with self._lock:
+            m = self.mon.pop(idx, None)
+        if m is None:
+            return
+        try:
+            m["proc"].terminate()
+            m["proc"].wait(timeout=1)
+        except Exception:
+            try:
+                m["proc"].kill()
+            except Exception:
+                pass
+
+    def stop_all(self):
+        for idx in list(self.mon):
+            self._stop(idx)
 
 
 # Общая громкость текущего аудиовыхода (default sink)
@@ -1635,6 +1729,8 @@ def collect():
     """
     procs = snapshot_procs()
     all_streams = pactl_json("sink-inputs")
+    if LEVELS is not None:
+        LEVELS.sync(all_streams)              # измерители уровня: «звучит» по сигналу, а не по флагу
     clients = pactl_json("clients")
     store, wp = load_store(), wp_remembered()
 
@@ -1646,7 +1742,7 @@ def collect():
         pid = int(raw) if raw.isdigit() else 0
         binary = p.get("application.process.binary") or ""
         name = p.get("application.name") or p.get("application.id") or ""
-        if not (name or binary):
+        if not (name or binary) or name == LEVEL_CLIENT:
             continue
         if pid and (is_generic_binary(binary) or is_generic_binary(name)) and (
                 own_tool(pid) or pid not in procs):
@@ -3502,6 +3598,9 @@ class MixerWindow(Adw.ApplicationWindow):
         # timer going; handed to idle_add directly it would repeat forever — every fix used to add
         # another endless loop, up to dozens of refreshes and pactl calls per second.)
         self._refresh_idle = 0
+        global LEVELS
+        if LEVELS is None:
+            LEVELS = LevelMonitor()
         self.guard = VolumeGuard(on_fix=self._refresh_soon)
         self.guard.start()
         self.connect("close-request", self._on_close)
@@ -3704,6 +3803,8 @@ class MixerWindow(Adw.ApplicationWindow):
     def _on_close(self, *_):
         """Closing ends everything: the guard, the refresh timer, a pending refresh — and the app."""
         self.guard.stop()
+        if LEVELS is not None:
+            LEVELS.stop_all()
         for attr in ("_refresh_timer", "_refresh_idle"):
             src = getattr(self, attr, 0)
             if src:
