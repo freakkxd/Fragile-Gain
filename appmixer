@@ -2151,6 +2151,16 @@ def set_mute(row, muted):
     save_store(store)
 
 
+def _die_with_parent():
+    """В дочернем процессе: получить SIGTERM, когда умрёт родитель (Linux prctl)."""
+    try:
+        import ctypes
+        import signal as _signal
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, _signal.SIGTERM)   # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+
+
 class VolumeGuard:
     """Держит запомненную громкость у НОВЫХ потоков.
 
@@ -2175,19 +2185,32 @@ class VolumeGuard:
         for si in pactl_json("sink-inputs"):
             self.seen.add(si.get("index"))            # то, что играет сейчас, не трогаем
         try:
-            self.proc = Gio.Subprocess.new(
-                ["pactl", "subscribe"],
-                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
+            # pactl умирает вместе с микшером при ЛЮБОМ завершении (kill, падение):
+            # иначе осиротевшие `pactl subscribe` копятся и забивают лимит клиентов
+            # pipewire-pulse — после этого ни один pactl не может подключиться.
+            self.proc = subprocess.Popen(
+                ["pactl", "subscribe"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, preexec_fn=_die_with_parent)
         except Exception:
+            self.proc = None
             return False
-        self.stream = Gio.DataInputStream.new(self.proc.get_stdout_pipe())
+        self.stream = Gio.DataInputStream.new(
+            Gio.UnixInputStream.new(self.proc.stdout.fileno(), False))
         self._read()
         return True
 
     def stop(self):
         if self.proc is not None:
             try:
-                self.proc.force_exit()
+                self.proc.terminate()
+                self.proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            try:
+                self.proc.stdout.close()
             except Exception:
                 pass
             self.proc = None
