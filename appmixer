@@ -2288,8 +2288,10 @@ class VolumeGuard:
     FRESH = 2.5     # секунд после появления поток перепроверяем: приложение может
                     # выставить свою громкость уже после создания потока
 
-    def __init__(self, on_fix=None):
+    def __init__(self, on_fix=None, on_change=None, busy=None):
         self.on_fix = on_fix
+        self.busy = busy                  # key -> True, пока пользователь двигает эту строку
+        self.on_change = on_change        # поток появился/исчез — окну пора обновить строки
         self.seen = set()
         self.fresh = {}
         self.proc = None
@@ -2341,6 +2343,8 @@ class VolumeGuard:
             if self.proc is not None:
                 GLib.timeout_add_seconds(3, self._restart)
             return
+        if self.on_change and ("on sink-input" in line) and ("'new'" in line or "'remove'" in line):
+            self.on_change()
         if "'new' on sink-input" in line:
             for delay in (0, 300, 1200):              # сразу и ещё пару раз: вдруг приложение переставит
                 GLib.timeout_add(delay, self._check_once)
@@ -2363,6 +2367,10 @@ class VolumeGuard:
         volumes, muted = store["volumes"], store.get("muted", {})
         changed = False
         for row in rows:
+            if self.busy is not None and self.busy(row["key"]):
+                for si in row.get("streams") or []:
+                    self.seen.add(si.get("index"))   # громкость задаёт пользователь, не страж
+                continue
             want = volumes.get(row["key"])
             want_mute = muted.get(row["key"])
             for si in row.get("streams") or []:
@@ -2845,7 +2853,14 @@ class AppRow(Gtk.ListBoxRow):
         changes = [(self, vol)]
         delta = vol - self.gesture["parent"]
         for k in kids:
-            base = self.gesture["kids"].get(k.app["key"], int(k.app.get("volume") or 0))
+            key = k.app["key"]
+            if key not in self.gesture["kids"]:
+                # источник появился посреди жеста (Anki запускает mpv на каждую карточку):
+                # он следует за родителем от СВОЕГО значения в этот момент — один раз
+                # зафиксированная база, иначе сдвиг применялся бы снова и снова
+                cur = k.shown_volume if k.shown_volume is not None else int(k.app.get("volume") or 0)
+                self.gesture["kids"][key] = cur - (prev - self.gesture["parent"])
+            base = self.gesture["kids"][key]
             upper = int(k.scale.get_adjustment().get_upper())
             kv = max(0, min(max(upper, base), base + delta))
             if kv != k.shown_volume:
@@ -3673,7 +3688,8 @@ class MixerWindow(Adw.ApplicationWindow):
         global LEVELS
         if LEVELS is None:
             LEVELS = LevelMonitor()
-        self.guard = VolumeGuard(on_fix=self._refresh_soon)
+        self.guard = VolumeGuard(on_fix=self._refresh_soon, on_change=self._refresh_soon,
+                                 busy=self._user_busy)
         self.guard.start()
         self.connect("close-request", self._on_close)
         self._refresh_timer = GLib.timeout_add(REFRESH_MS, self.refresh)
@@ -4021,9 +4037,31 @@ class MixerWindow(Adw.ApplicationWindow):
                 self._send_stream_volume(si["index"], vol)
             if not app.get("streams") and app.get("ident"):
                 self._later("phantom:" + app["key"], APPLY_DELAY_MS,
-                            lambda app=app, vol=vol: phantom(app["ident"], vol))
+                            lambda app=app, vol=vol: self._apply_silent(app, vol))
             self._remember[app["key"]] = (app, vol)
         self._later("remember", 150, self._flush_remember)
+
+    def _user_busy(self, key):
+        """Строку сейчас двигают (или её значение ещё не записано) — стражу не трогать."""
+        if key in self._remember:
+            return True
+        row = self.rows.get(key)
+        return row is not None and time.monotonic() - row.last_user_change < 1.5
+
+    def _apply_silent(self, app, vol):
+        """Строка молчала, когда двигали ползунок. Если за это время у неё появился
+        поток (приложение начало играть) — громкость ему, а не «фантому»: иначе живой
+        поток остался бы на старой громкости, а после паузы строка «скакнула» бы."""
+        fresh = next((a for a in collect() if a["key"] == app["key"]), None)
+        streams = (fresh or {}).get("streams") or []
+        if streams:
+            for si in streams:
+                self._send_stream_volume(si["index"], vol)
+            row = self.rows.get(app["key"])
+            if row is not None:
+                row.app = fresh
+        elif app.get("ident"):
+            phantom(app["ident"], vol)
 
     def _send_stream_volume(self, idx, vol):
         if idx in self._inflight:
