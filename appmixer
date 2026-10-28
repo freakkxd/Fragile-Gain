@@ -783,7 +783,7 @@ def wp_remembered():
     if _wp_cache["mtime"] == mtime:
         return _wp_cache["table"]
 
-    table, head = {}, "Output/Audio:"
+    table, mutes, head = {}, {}, "Output/Audio:"
     try:
         text = WP_PROPS.read_text(errors="replace")
     except OSError:
@@ -801,7 +801,11 @@ def wp_remembered():
             continue
         if pct is not None:
             table[wp_unescape(key)] = pct
-    _wp_cache["mtime"], _wp_cache["table"] = mtime, table
+            try:
+                mutes[wp_unescape(key)] = bool(json.loads(val).get("mute"))
+            except Exception:
+                pass
+    _wp_cache["mtime"], _wp_cache["table"], _wp_cache["mute"] = mtime, table, mutes
     return table
 
 
@@ -2084,11 +2088,16 @@ def collect():
         else:
             # покоящееся приложение: сначала память WirePlumber (её же видят
             # pavucontrol/wpctl), потом своя, потом 100 %
-            pct = wp_lookup(wp, ident) if ident else None
-            if pct is None:
-                pct = store["volumes"].get(key)
+            # покоящееся приложение: сначала то, что вы задали ЭТОЙ строке в микшере
+            # (память WirePlumber общая на всех с тем же именем — mpv у Anki и mpv
+            # где-то ещё — и её меняют сами приложения), потом WirePlumber, потом 100 %
+            pct = store["volumes"].get(key)
+            wp_mute = False
+            if pct is None and ident:
+                pct = wp_lookup(wp, ident)
+                wp_mute = bool(wp_lookup(_wp_cache.get("mute", {}), ident))
             volume = 100 if pct is None else int(pct)
-            mute = volume == 0
+            mute = volume == 0 or bool(store.get("muted", {}).get(key)) or wp_mute
 
         # что сейчас играет: заголовок плеера (вкладка браузера, трек) либо имя
         # потока (файл mpv); подпись из них собирается в самом конце
